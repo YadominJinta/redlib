@@ -417,6 +417,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
+| `WREQ_EMULATION`          | `["none", "chrome", "firefox", "random"]` | `none` | TLS/HTTP2 fingerprint Redlib presents to Reddit. Reddit blocks the browser profiles, so `none` is the default. |
 
 ## Default user settings
 

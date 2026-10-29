@@ -46,6 +46,13 @@ const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
+/// Client used for the OAuth token endpoints. Reddit's blocklists are keyed on
+/// the TLS fingerprint and disagree per endpoint: the API (`oauth.reddit.com`)
+/// refuses the browser emulations, while the token endpoints
+/// (`www.reddit.com/auth/v2/...`) are flaky for a plain fingerprint. Minting
+/// keeps a browser profile so it stays reliable.
+pub static TOKEN_CLIENT: LazyLock<WreqClient> = LazyLock::new(build_token_client);
+
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
 	tokio::spawn(token_daemon());
@@ -88,19 +95,63 @@ impl Resolve for RedditDnsResolver {
 }
 
 pub fn build_client() -> WreqClient {
-	// Keeping this list short to aid in privacy.
-	// The more emulations, the more unique a fingerprint each instance has.
-	// But some emulations should increase evasiveness.
-	let emulation = [Profile::Chrome145, Profile::Firefox147];
-	let emulation_platform = [Platform::Android, Platform::Windows];
+	// Reddit blocks requests by TLS fingerprint: its edge answers the browser
+	// profiles below (and curl's stock ClientHello) with the HTML "You've been
+	// blocked by network security" page, while plain, non-emulated clients still
+	// get served. `REDLIB_WREQ_EMULATION=none` falls back to the TLS stack's own
+	// defaults; `chrome`/`firefox` pin a single profile instead of rolling one.
+	let choice = crate::config::get_setting("REDLIB_WREQ_EMULATION").unwrap_or_else(|| "none".to_string());
 
+	let emulation = match choice.to_ascii_lowercase().as_str() {
+		"none" | "" => None,
+		"chrome" => Some(
+			Emulation::builder()
+				.profile(Profile::Chrome145)
+				.platform(Platform::Android)
+				.build(),
+		),
+		"firefox" => Some(
+			Emulation::builder()
+				.profile(Profile::Firefox147)
+				.platform(Platform::Windows)
+				.build(),
+		),
+		// Historical behaviour: roll a random browser profile per instance.
+		_ => {
+			let profiles = [Profile::Chrome145, Profile::Firefox147];
+			let platforms = [Platform::Android, Platform::Windows];
+			let rand = fastrand::usize(..);
+			Some(
+				Emulation::builder()
+					.profile(profiles[rand % profiles.len()])
+					.platform(platforms[rand % platforms.len()])
+					.build(),
+			)
+		}
+	};
+
+	info!("Building Wreq client with emulation {choice}");
+	let builder = WreqClient::builder();
+	let builder = match emulation {
+		Some(emulation) => builder.emulation(emulation),
+		None => builder,
+	};
+	builder
+		.redirect(Policy::none())
+		.dns_resolver(RedditDnsResolver)
+		.build()
+		.expect("Should always be able to build a client")
+}
+
+pub fn build_token_client() -> WreqClient {
 	let rand = fastrand::usize(..);
+	let profiles = [Profile::Chrome145, Profile::Firefox147];
+	let platforms = [Platform::Android, Platform::Windows];
 	let emulation = Emulation::builder()
-		.profile(emulation[rand % emulation.len()])
-		.platform(emulation_platform[rand % emulation_platform.len()])
+		.profile(profiles[rand % profiles.len()])
+		.platform(platforms[rand % platforms.len()])
 		.build();
 
-	info!("Building Wreq client with random emulation");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
