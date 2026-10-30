@@ -1,5 +1,5 @@
 use crate::{
-	client::{OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING, TOKEN_CLIENT},
+	client::{OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING, EMULATED_CLIENT},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -220,7 +220,7 @@ impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
-		let mut builder = TOKEN_CLIENT.post(&url);
+		let mut builder = EMULATED_CLIENT.post(&url);
 
 		// Add headers from spoofed client
 		for (key, value) in &self.device.initial_headers {
@@ -335,7 +335,7 @@ impl OauthBackend for GenericWebAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let url = "https://www.reddit.com/api/v1/access_token";
-		let mut builder = TOKEN_CLIENT.post(url);
+		let mut builder = EMULATED_CLIENT.post(url);
 
 		// Add minimal headers
 		builder = builder.header("Host", "www.reddit.com");

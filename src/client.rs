@@ -46,12 +46,35 @@ const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
-/// Client used for the OAuth token endpoints. Reddit's blocklists are keyed on
-/// the TLS fingerprint and disagree per endpoint: the API (`oauth.reddit.com`)
-/// refuses the browser emulations, while the token endpoints
-/// (`www.reddit.com/auth/v2/...`) are flaky for a plain fingerprint. Minting
-/// keeps a browser profile so it stays reliable.
-pub static TOKEN_CLIENT: LazyLock<WreqClient> = LazyLock::new(build_token_client);
+/// Emulated-browser client. Reddit's blocklists are keyed on the TLS
+/// fingerprint and disagree per endpoint: `oauth.reddit.com` currently refuses
+/// the browser profiles, while the token endpoints (`www.reddit.com/auth/v2/…`)
+/// are flaky for a plain one. Minting therefore always emulates.
+pub static EMULATED_CLIENT: LazyLock<WreqClient> = LazyLock::new(build_emulated_client);
+
+/// Set once `json` finds that the plain fingerprint is blocked, so the switch
+/// only has to be paid for once.
+static USE_EMULATED_API_CLIENT: AtomicBool = AtomicBool::new(false);
+
+/// Applies the `REDLIB_WREQ_EMULATION` preference to the starting fingerprint.
+static API_CLIENT_INIT: LazyLock<()> = LazyLock::new(|| {
+	let choice = crate::config::get_setting("REDLIB_WREQ_EMULATION").unwrap_or_else(|| "none".to_string());
+	if !matches!(choice.to_ascii_lowercase().as_str(), "none" | "") {
+		USE_EMULATED_API_CLIENT.store(true, Ordering::Relaxed);
+	}
+	info!("Starting with emulated API fingerprint: {}", USE_EMULATED_API_CLIENT.load(Ordering::Relaxed));
+});
+
+/// The client used for `oauth.reddit.com`. Which fingerprint family Reddit
+/// blocks changes without notice, so this follows whatever last worked.
+fn api_client() -> &'static WreqClient {
+	LazyLock::force(&API_CLIENT_INIT);
+	if USE_EMULATED_API_CLIENT.load(Ordering::Relaxed) {
+		&EMULATED_CLIENT
+	} else {
+		&CLIENT
+	}
+}
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -94,64 +117,33 @@ impl Resolve for RedditDnsResolver {
 	}
 }
 
+/// Plain client: no browser emulation, the TLS/HTTP2 stack's own defaults.
+///
+/// Reddit's edge answers the browser profiles wreq emulates with its HTML
+/// "You've been blocked by network security" page, while plain clients are still
+/// served, so this is what API requests start with.
 pub fn build_client() -> WreqClient {
-	// Reddit blocks requests by TLS fingerprint: its edge answers the browser
-	// profiles below (and curl's stock ClientHello) with the HTML "You've been
-	// blocked by network security" page, while plain, non-emulated clients still
-	// get served. `REDLIB_WREQ_EMULATION=none` falls back to the TLS stack's own
-	// defaults; `chrome`/`firefox` pin a single profile instead of rolling one.
-	let choice = crate::config::get_setting("REDLIB_WREQ_EMULATION").unwrap_or_else(|| "none".to_string());
-
-	let emulation = match choice.to_ascii_lowercase().as_str() {
-		"none" | "" => None,
-		"chrome" => Some(
-			Emulation::builder()
-				.profile(Profile::Chrome145)
-				.platform(Platform::Android)
-				.build(),
-		),
-		"firefox" => Some(
-			Emulation::builder()
-				.profile(Profile::Firefox147)
-				.platform(Platform::Windows)
-				.build(),
-		),
-		// Historical behaviour: roll a random browser profile per instance.
-		_ => {
-			let profiles = [Profile::Chrome145, Profile::Firefox147];
-			let platforms = [Platform::Android, Platform::Windows];
-			let rand = fastrand::usize(..);
-			Some(
-				Emulation::builder()
-					.profile(profiles[rand % profiles.len()])
-					.platform(platforms[rand % platforms.len()])
-					.build(),
-			)
-		}
-	};
-
-	info!("Building Wreq client with emulation {choice}");
-	let builder = WreqClient::builder();
-	let builder = match emulation {
-		Some(emulation) => builder.emulation(emulation),
-		None => builder,
-	};
-	builder
+	info!("Building plain Wreq client");
+	WreqClient::builder()
 		.redirect(Policy::none())
 		.dns_resolver(RedditDnsResolver)
 		.build()
 		.expect("Should always be able to build a client")
 }
 
-pub fn build_token_client() -> WreqClient {
-	let rand = fastrand::usize(..);
+/// Fallback client that presents a random browser profile.
+pub fn build_emulated_client() -> WreqClient {
+	// Keeping this list short to aid in privacy: every extra profile makes an
+	// instance more unique.
 	let profiles = [Profile::Chrome145, Profile::Firefox147];
 	let platforms = [Platform::Android, Platform::Windows];
+	let rand = fastrand::usize(..);
 	let emulation = Emulation::builder()
 		.profile(profiles[rand % profiles.len()])
 		.platform(platforms[rand % platforms.len()])
 		.build();
 
+	info!("Building emulated Wreq client");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
@@ -426,7 +418,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let mut builder = CLIENT.request(method.clone(), &url);
+	let mut builder = api_client().request(method.clone(), &url);
 
 	for (key, value) in headers {
 		builder = builder.header(key, value);
@@ -542,13 +534,54 @@ fn comments_logical_path(path: &str) -> String {
 	format!("/r/{subreddit}/comments/{tail}")
 }
 
-/// Make a request to a Reddit API and parse the JSON response
+/// Make a request to a Reddit API and parse the JSON response.
+///
+/// Reddit blocklists TLS fingerprints and the list changes without notice, so a
+/// block is retried once with the other fingerprint (see `api_client`) and the
+/// switch is remembered for later requests.
 #[cached(size = 100, time = 30, result = true)]
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
+	let using_emulated = USE_EMULATED_API_CLIENT.load(Ordering::Relaxed);
+
+	match json_with_client(path.clone(), quarantine).await {
+		Ok(value) => Ok(value),
+		Err(JsonFailure { message, blocked: true }) => {
+			warn!(
+				"Reddit blocked the {} TLS fingerprint, retrying with the other one",
+				if using_emulated { "emulated" } else { "plain" }
+			);
+			USE_EMULATED_API_CLIENT.store(!using_emulated, Ordering::Relaxed);
+			match json_with_client(path, quarantine).await {
+				Ok(value) => {
+					warn!("The other TLS fingerprint is not blocked, using it for API requests from now on");
+					Ok(value)
+				}
+				Err(_) => {
+					USE_EMULATED_API_CLIENT.store(using_emulated, Ordering::Relaxed);
+					Err(message)
+				}
+			}
+		}
+		Err(JsonFailure { message, .. }) => Err(message),
+	}
+}
+
+struct JsonFailure {
+	message: String,
+	/// Reddit answered with its HTML block page instead of JSON.
+	blocked: bool,
+}
+
+impl JsonFailure {
+	fn other(message: String) -> Self {
+		Self { message, blocked: false }
+	}
+}
+
+async fn json_with_client(path: String, quarantine: bool) -> Result<Value, JsonFailure> {
 	// Closure to quickly build errors
-	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
-		// eprintln!("{} - {}: {}", url, msg, e);
-		Err(format!("{msg}: {e} | {path}"))
+	let err = |msg: &str, e: String, path: String| -> Result<Value, JsonFailure> {
+		Err(JsonFailure::other(format!("{msg}: {e} | {path}")))
 	};
 
 	// First, handle rolling over the OAUTH_CLIENT if need be.
@@ -595,11 +628,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						// Rate limited, so spawn a force_refresh_token()
 						tokio::spawn(force_refresh_token());
 						return match reset {
-							Some(val) => Err(format!(
+							Some(val) => Err(JsonFailure::other(format!(
 								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
 								 Rate limit will reset in: {val}"
-							)),
-							None => Err("Reddit rate limit exceeded".to_string()),
+							))),
+							None => Err(JsonFailure::other("Reddit rate limit exceeded".to_string())),
 						};
 					}
 
@@ -612,7 +645,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 							if let Some(data) = json.get("data") {
 								if let Some(is_suspended) = data.get("is_suspended").and_then(Value::as_bool) {
 									if is_suspended {
-										return Err("suspended".into());
+										return Err(JsonFailure::other("suspended".into()));
 									}
 								}
 							}
@@ -623,27 +656,30 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 								if json["message"] == "Unauthorized" {
 									error!("Forcing a token refresh");
 									let () = force_refresh_token().await;
-									return Err("OAuth token has expired. Please refresh the page!".to_string());
+									return Err(JsonFailure::other("OAuth token has expired. Please refresh the page!".to_string()));
 								}
 
 								// Handle quarantined
 								if json["reason"] == "quarantined" {
-									return Err("quarantined".into());
+									return Err(JsonFailure::other("quarantined".into()));
 								}
 								// Handle gated
 								if json["reason"] == "gated" {
-									return Err("gated".into());
+									return Err(JsonFailure::other("gated".into()));
 								}
 								// Handle private subs
 								if json["reason"] == "private" {
-									return Err("private".into());
+									return Err(JsonFailure::other("private".into()));
 								}
 								// Handle banned subs
 								if json["reason"] == "banned" {
-									return Err("banned".into());
+									return Err(JsonFailure::other("banned".into()));
 								}
 
-								Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
+								Err(JsonFailure::other(format!(
+									"Reddit error {} \"{}\": {} | {path}",
+									json["error"], json["reason"], json["message"]
+								)))
 							} else {
 								Ok(json)
 							}
@@ -651,9 +687,13 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
 							if status.is_server_error() {
-								Err("Reddit is having issues, check if there's an outage".to_string())
+								Err(JsonFailure::other("Reddit is having issues, check if there's an outage".to_string()))
 							} else {
-								err("Failed to parse page JSON data", e.to_string(), path)
+								Err(JsonFailure {
+									message: format!("Failed to parse page JSON data: {e} | {path}"),
+									// The body was not JSON at all: Reddit served its block page.
+									blocked: status == wreq::StatusCode::FORBIDDEN,
+								})
 							}
 						}
 					}
@@ -735,6 +775,21 @@ mod tests {
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+
+	#[test]
+	fn test_api_client_follows_the_block_switch() {
+		// `json` flips this flag when Reddit blocks a fingerprint; the next
+		// request has to go out with the other client.
+		LazyLock::force(&API_CLIENT_INIT);
+
+		USE_EMULATED_API_CLIENT.store(false, Ordering::Relaxed);
+		assert_eq!(api_client() as *const WreqClient, &*CLIENT as *const WreqClient);
+
+		USE_EMULATED_API_CLIENT.store(true, Ordering::Relaxed);
+		assert_eq!(api_client() as *const WreqClient, &*EMULATED_CLIENT as *const WreqClient);
+
+		USE_EMULATED_API_CLIENT.store(false, Ordering::Relaxed);
+	}
 
 	#[test]
 	fn test_reddit_dns_name_uses_fastly_dualstack_alias() {
