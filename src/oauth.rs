@@ -1,5 +1,5 @@
 use crate::{
-	client::{OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING, EMULATED_CLIENT},
+	client::{OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -86,7 +86,7 @@ impl Oauth {
 					error!(
 						"[⛔] Failed to create OAuth client: {}. Retrying in 5 seconds...",
 						match e {
-							AuthError::Wreq(error) => error.to_string(),
+							AuthError::Http(error) => error,
 							AuthError::SerdeDeserialize(error) => error.to_string(),
 							AuthError::Field((value, error)) => format!("{error}\n{value}"),
 						}
@@ -140,15 +140,9 @@ impl Oauth {
 
 #[derive(Debug)]
 enum AuthError {
-	Wreq(wreq::Error),
+	Http(String),
 	SerdeDeserialize(serde_json::Error),
 	Field((serde_json::Value, &'static str)),
-}
-
-impl From<wreq::Error> for AuthError {
-	fn from(err: wreq::Error) -> Self {
-		AuthError::Wreq(err)
-	}
 }
 
 impl From<serde_json::Error> for AuthError {
@@ -220,52 +214,51 @@ impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
-		let mut builder = EMULATED_CLIENT.post(&url);
 
-		// Add headers from spoofed client
-		for (key, value) in &self.device.initial_headers {
-			builder = builder.header(key, value);
-		}
+		let mut headers: Vec<(String, String)> = self.device.initial_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
 		// Set up HTTP Basic Auth - basically just the const OAuth ID's with no password,
 		// Base64-encoded. https://en.wikipedia.org/wiki/Basic_access_authentication
 		// This could be constant, but I don't think it's worth it. OAuth ID's can change
 		// over time and we want to be flexible.
 		let auth = general_purpose::STANDARD.encode(format!("{}:", self.device.oauth_id));
-		builder = builder.header("Authorization", format!("Basic {auth}"));
+		headers.push(("Authorization".into(), format!("Basic {auth}")));
+		headers.push(("Content-Type".into(), "application/json; charset=UTF-8".into()));
 
 		// Set JSON body. I couldn't tell you what this means. But that's what the client sends
-		let json = json!({
+		let body = json!({
 				"scopes": ["*","email", "pii"]
-		});
+		})
+		.to_string();
 
 		trace!("Sending token request to {url}...");
 
 		// Send request
-		let resp = builder.json(&json).send().await?;
+		let resp = crate::http::request("POST", &url, &headers, Some(body.into_bytes()))
+			.await
+			.map_err(AuthError::Http)?;
 
-		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
-		trace!("OAuth headers: {:#?}", resp.headers());
+		trace!("Received response with status {} and length {:?}", resp.status, resp.headers.get("content-length"));
+		trace!("OAuth headers: {:#?}", resp.headers);
 
 		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
 		// Technically it's not needed, but it's easy for Reddit API to check for this.
 		// It's some kind of header that uniquely identifies the device.
 		// Not worried about the privacy implications, since this is randomly changed
 		// and really only as privacy-concerning as the OAuth token itself.
-		if let Some(header) = resp.headers().get("x-reddit-loid") {
-			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-loid".to_owned(), header_val.to_str().unwrap().to_string());
+		if let Some(header) = resp.headers.get("x-reddit-loid") {
+			self.additional_headers.insert("x-reddit-loid".to_owned(), header.to_str().unwrap_or_default().to_string());
 		}
 
 		// Same with x-reddit-session
-		if let Some(header) = resp.headers().get("x-reddit-session") {
-			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-session".to_owned(), header_val.to_str().unwrap().to_string());
+		if let Some(header) = resp.headers.get("x-reddit-session") {
+			self.additional_headers.insert("x-reddit-session".to_owned(), header.to_str().unwrap_or_default().to_string());
 		}
 
 		trace!("Serializing response...");
 
 		// Serialize response
-		let json: serde_json::Value = resp.json().await?;
+		let json: serde_json::Value = serde_json::from_slice(&resp.body).map_err(AuthError::SerdeDeserialize)?;
 
 		trace!("Accessing relevant fields...");
 
@@ -335,18 +328,18 @@ impl OauthBackend for GenericWebAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let url = "https://www.reddit.com/api/v1/access_token";
-		let mut builder = EMULATED_CLIENT.post(url);
 
 		// Add minimal headers
-		builder = builder.header("Host", "www.reddit.com");
-		builder = builder.header("User-Agent", &self.user_agent);
-		builder = builder.header("Accept", "*/*");
-		builder = builder.header("Accept-Language", "en-US,en;q=0.5");
-		// builder = builder.header("Accept-Encoding", "gzip, deflate, br, zstd");
-		builder = builder.header("Authorization", "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=");
-		builder = builder.header("Content-Type", "application/x-www-form-urlencoded");
-		builder = builder.header("Sec-GPC", "1");
-		builder = builder.header("Connection", "keep-alive");
+		let mut headers: Vec<(String, String)> = vec![
+			("Host".into(), "www.reddit.com".into()),
+			("User-Agent".into(), self.user_agent.clone()),
+			("Accept".into(), "*/*".into()),
+			("Accept-Language".into(), "en-US,en;q=0.5".into()),
+			("Authorization".into(), "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=".into()),
+			("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+			("Sec-GPC".into(), "1".into()),
+			("Connection".into(), "keep-alive".into()),
+		];
 
 		// Set up form body
 		let body_str = format!("grant_type=https%3A%2F%2Foauth.reddit.com%2Fgrants%2Finstalled_client&device_id={}", self.device_id);
@@ -354,31 +347,33 @@ impl OauthBackend for GenericWebAuth {
 		trace!("Sending GenericWebAuth token request to {url}...");
 
 		// Send request
-		let resp: wreq::Response = builder.body(body_str).send().await?;
+		let resp = crate::http::request("POST", url, &headers, Some(body_str.into_bytes()))
+			.await
+			.map_err(AuthError::Http)?;
 
-		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
-		trace!("GenericWebAuth headers: {:#?}", resp.headers());
+		headers.clear();
+
+		trace!("Received response with status {} and length {:?}", resp.status, resp.headers.get("content-length"));
+		trace!("GenericWebAuth headers: {:#?}", resp.headers);
 
 		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
 		// Technically it's not needed, but it's easy for Reddit API to check for this.
 		// It's some kind of header that uniquely identifies the device.
 		// Not worried about the privacy implications, since this is randomly changed
 		// and really only as privacy-concerning as the OAuth token itself.
-		if let Some(header) = resp.headers().get("x-reddit-loid") {
-			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-loid".to_owned(), header_val.to_str().unwrap().to_string());
+		if let Some(header) = resp.headers.get("x-reddit-loid") {
+			self.additional_headers.insert("x-reddit-loid".to_owned(), header.to_str().unwrap_or_default().to_string());
 		}
 
 		// Same with x-reddit-session
-		if let Some(header) = resp.headers().get("x-reddit-session") {
-			let header_val: &wreq::header::HeaderValue = header;
-			self.additional_headers.insert("x-reddit-session".to_owned(), header_val.to_str().unwrap().to_string());
+		if let Some(header) = resp.headers.get("x-reddit-session") {
+			self.additional_headers.insert("x-reddit-session".to_owned(), header.to_str().unwrap_or_default().to_string());
 		}
 
 		trace!("Serializing GenericWebAuth response...");
 
 		// Serialize response
-		let json: serde_json::Value = resp.json().await?;
+		let json: serde_json::Value = serde_json::from_slice(&resp.body).map_err(AuthError::SerdeDeserialize)?;
 
 		trace!("Accessing relevant fields...");
 

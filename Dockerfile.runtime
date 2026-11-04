@@ -1,0 +1,16 @@
+# Runtime image only: the binary is compiled on the host by
+# scripts/build-local-image.sh, so building this image is a single COPY.
+FROM alpine:3.19
+
+RUN apk add --no-cache libgcc libstdc++
+
+COPY target/aarch64-unknown-linux-musl/release/redlib /usr/local/bin/redlib
+
+RUN adduser --home /nonexistent --no-create-home --disabled-password redlib
+USER redlib
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=1m --timeout=3s CMD wget --spider -q http://localhost:8080/settings || exit 1
+
+CMD ["redlib"]

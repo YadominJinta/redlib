@@ -417,7 +417,6 @@ Assign a default value for each instance-specific setting by passing environment
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
-| `WREQ_EMULATION`          | `["none", "chrome", "firefox", "random"]` | `none` | TLS/HTTP2 fingerprint Redlib presents to Reddit. Reddit blocks the browser profiles, so `none` is the default. |
 
 ## Default user settings
 
@@ -447,40 +446,29 @@ Assign a default value for each user-modifiable setting by passing environment v
 
 ## Forward Proxies
 
-Redlib [supports](https://docs.rs/wreq/latest/wreq/#proxies) proxy usage using the standard `HTTP_PROXY` and
-`HTTPS_PROXY` environment variables. Use `ALL_PROXY` to set both at the same time (which you want to do).
-
-- `http://` is the scheme for http proxy
-- `https://` is the scheme for https proxy
-- `socks4://` is the scheme for socks4 proxy
-- `socks4a://` is the scheme for socks4a proxy
-- `socks5://` is the scheme for socks5 proxy
-- `socks5h://` is the scheme for socks5h proxy
+Redlib does not currently support a forward proxy: requests go directly, hyper over rustls.
 
 ## Security
 
-This project uses [BoringSSL](https://boringssl.googlesource.com/boringssl/), built from source with patches from
-the [wreq](https://github.com/0x676e67/wreq) project. Certificates are validated against the embedded trust store from Mozilla.
+This project uses [rustls](https://github.com/rustls/rustls) with the `ring` crypto provider, and validates
+certificates against the trust store embedded from Mozilla (`webpki-roots`).
+
+Requests are HTTP/1.1 only: Reddit answers HTTP/2 from non-browser clients with its "blocked by network
+security" page, so the client deliberately does not negotiate h2.
 
 ## Building
 
-Since Redlib uses [`boring-sys2`](https://crates.io/crates/boring-sys2), to build Redlib you will need to build
-BoringSSL from source.
+There are no C/C++ dependencies apart from `ring`, which only needs a C compiler.
 
-### Linux/MacOS
-
-Refer to the [boringssl](https://github.com/google/boringssl/blob/main/BUILDING.md) documentation for dependencies.
-
-### Windows
-
-Install MSVC, which you likely already have for Rust.
-
-```pwsh
-# Make sure to update your PATH, some of the installers don't do that by default (hense -i, interactive mode).
-winget install -i Kitware.CMake
-winget install -i NASM.NASM
-winget install -i LLVM.LLVM
-
-# For tests.
-winget install GoLang.Go
+```sh
+cargo build --release
 ```
+
+The Docker image is built from a binary compiled on the host. For a native build to
+`aarch64-unknown-linux-musl` install `musl-tools` and run:
+
+```sh
+sudo apt-get install musl-tools
+./scripts/build-local-image.sh
+```
+

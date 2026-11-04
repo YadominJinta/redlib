@@ -4,22 +4,19 @@ use crate::server::RequestExt;
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
 use cached::proc_macro::cached;
+use crate::http::{self, Reply};
 use futures_lite::future::block_on;
 use futures_lite::{future::Boxed, FutureExt};
-use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperResponse};
-use log::{error, info, trace, warn};
+use hyper::{header, Body, Request as HyperRequest, Response as HyperResponse};
+use log::{error, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::{Arc, LazyLock};
-use wreq::cookie::Jar;
-use wreq::dns::{Addrs, Name, Resolve, Resolving};
-use wreq::redirect::Policy;
-use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
-use wreq_util::{Emulation, Platform, Profile};
+use std::sync::{LazyLock, Mutex};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
@@ -29,7 +26,6 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
-const ALTERNATIVE_REDDIT_DNS_HOST: &str = "dualstack.reddit.map.fastly.net";
 
 const SHREDDIT_PATH_PREFIX: &str = "/svc/shreddit/";
 // Asks for the bare fragment instead of a full page shell, roughly halving the response.
@@ -40,41 +36,9 @@ const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</tit
 // Logged-out reddit.com session shared by shreddit requests. Reddit challenges
 // cookieless clients after about ten requests, but gives each session a budget
 // of a couple hundred requests. It is kept apart from the OAuth API requests on purpose.
-static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
+static SHREDDIT_SESSION: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 // Leaves room for the requests already in flight when the session is rotated.
 const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
-
-pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
-
-/// Emulated-browser client. Reddit's blocklists are keyed on the TLS
-/// fingerprint and disagree per endpoint: `oauth.reddit.com` currently refuses
-/// the browser profiles, while the token endpoints (`www.reddit.com/auth/v2/…`)
-/// are flaky for a plain one. Minting therefore always emulates.
-pub static EMULATED_CLIENT: LazyLock<WreqClient> = LazyLock::new(build_emulated_client);
-
-/// Set once `json` finds that the plain fingerprint is blocked, so the switch
-/// only has to be paid for once.
-static USE_EMULATED_API_CLIENT: AtomicBool = AtomicBool::new(false);
-
-/// Applies the `REDLIB_WREQ_EMULATION` preference to the starting fingerprint.
-static API_CLIENT_INIT: LazyLock<()> = LazyLock::new(|| {
-	let choice = crate::config::get_setting("REDLIB_WREQ_EMULATION").unwrap_or_else(|| "none".to_string());
-	if !matches!(choice.to_ascii_lowercase().as_str(), "none" | "") {
-		USE_EMULATED_API_CLIENT.store(true, Ordering::Relaxed);
-	}
-	info!("Starting with emulated API fingerprint: {}", USE_EMULATED_API_CLIENT.load(Ordering::Relaxed));
-});
-
-/// The client used for `oauth.reddit.com`. Which fingerprint family Reddit
-/// blocks changes without notice, so this follows whatever last worked.
-fn api_client() -> &'static WreqClient {
-	LazyLock::force(&API_CLIENT_INIT);
-	if USE_EMULATED_API_CLIENT.load(Ordering::Relaxed) {
-		&EMULATED_CLIENT
-	} else {
-		&CLIENT
-	}
-}
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -90,67 +54,6 @@ const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
 	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
 ];
-
-#[derive(Debug)]
-struct RedditDnsResolver;
-
-// Keep the original request host for TLS/SNI and HTTP while resolving its
-// addresses through Fastly's dual-stack alias.
-fn reddit_dns_name(name: &str) -> &str {
-	if name.eq_ignore_ascii_case(ALTERNATIVE_REDDIT_URL_BASE_HOST) {
-		ALTERNATIVE_REDDIT_DNS_HOST
-	} else {
-		name
-	}
-}
-
-impl Resolve for RedditDnsResolver {
-	fn resolve(&self, name: Name) -> Resolving {
-		let dns_name = reddit_dns_name(name.as_str()).to_owned();
-
-		Box::pin(async move {
-			tokio::net::lookup_host((dns_name, 0))
-				.await
-				.map(|addresses| Box::new(addresses) as Addrs)
-				.map_err(Into::into)
-		})
-	}
-}
-
-/// Plain client: no browser emulation, the TLS/HTTP2 stack's own defaults.
-///
-/// Reddit's edge answers the browser profiles wreq emulates with its HTML
-/// "You've been blocked by network security" page, while plain clients are still
-/// served, so this is what API requests start with.
-pub fn build_client() -> WreqClient {
-	info!("Building plain Wreq client");
-	WreqClient::builder()
-		.redirect(Policy::none())
-		.dns_resolver(RedditDnsResolver)
-		.build()
-		.expect("Should always be able to build a client")
-}
-
-/// Fallback client that presents a random browser profile.
-pub fn build_emulated_client() -> WreqClient {
-	// Keeping this list short to aid in privacy: every extra profile makes an
-	// instance more unique.
-	let profiles = [Profile::Chrome145, Profile::Firefox147];
-	let platforms = [Platform::Android, Platform::Windows];
-	let rand = fastrand::usize(..);
-	let emulation = Emulation::builder()
-		.profile(profiles[rand % profiles.len()])
-		.platform(platforms[rand % platforms.len()])
-		.build();
-
-	info!("Building emulated Wreq client");
-	WreqClient::builder()
-		.emulation(emulation)
-		.redirect(Policy::none())
-		.dns_resolver(RedditDnsResolver)
-		.build()
-		.expect("Should always be able to build a client")
-}
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
 /// making a `HEAD` request to Reddit at the path given in `path`.
@@ -178,7 +81,7 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 		for (url_base, url_base_host) in URL_PAIRS {
 			res = reddit_short_head(path.clone(), true, url_base, url_base_host).await.ok();
 			if let Some(res) = &res {
-				if !res.status().is_client_error() {
+				if !res.status.is_client_error() {
 					break;
 				}
 			}
@@ -187,15 +90,15 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 	};
 
 	let res = res.ok_or_else(|| "Unable to make HEAD request to Reddit.".to_string())?;
-	let status = res.status().as_u16();
-	let policy_error = res.headers().get(wreq_header::RETRY_AFTER).is_some();
+	let status = res.status.as_u16();
+	let policy_error = res.headers.contains_key(header::RETRY_AFTER);
 
 	match status {
 		// If Reddit responds with a 2xx, then the path is already canonical.
 		200..=299 => Ok(Some(path)),
 
 		// If Reddit responds with a 301, then the path is redirected.
-		301 => match res.headers().get(wreq_header::LOCATION) {
+		301 => match res.headers.get(header::LOCATION) {
 			Some(val) => {
 				let Ok(original) = val.to_str() else {
 					return Err("Unable to decode Location header.".to_string());
@@ -231,9 +134,8 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 		403 if policy_error => Err("Too many requests.".to_string()),
 
 		_ => Ok(
-			res
-				.headers()
-				.get(wreq_header::LOCATION)
+			res.headers
+				.get(header::LOCATION)
 				.map(|val| percent_encode(val.as_bytes(), CONTROLS).to_string().trim_start_matches(REDDIT_URL_BASE).to_string()),
 		),
 	}
@@ -248,51 +150,46 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 		url = url.replace(&format!("{{{name}}}"), value);
 	}
 
-	// First parameter is target URL (mandatory).
-	let wreq_uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())?;
-
-	let mut builder = CLIENT.get(wreq_uri);
+	let mut headers: Vec<(String, String)> = Vec::new();
 
 	// Copy useful headers from original request
 	for &key in &["Range", "If-Modified-Since", "Cache-Control"] {
 		if let Some(value) = req.headers().get(key) {
-			builder = builder.header(key, value.as_bytes());
+			headers.push((key.to_string(), String::from_utf8_lossy(value.as_bytes()).to_string()));
 		}
 	}
 
 	// Add User-Agent header of the currently spoofed device
 	{
 		let client = OAUTH_CLIENT.load_full();
-		builder = builder.header("User-Agent", client.user_agent());
+		headers.push(("User-Agent".into(), client.user_agent().to_string()));
 	}
 
 	// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
-	builder = builder.header(wreq_header::ACCEPT, "*/*");
+	headers.push(("Accept".into(), "*/*".into()));
 
-	builder
-		.send()
-		.await
-		.map(|mut res| {
-			let headers = res.headers_mut();
+	let res = http::stream(&url, &headers).await?;
 
-			let mut rm = |key: &str| headers.remove(key);
+	let (mut parts, body) = res.into_parts();
 
-			rm("access-control-expose-headers");
-			rm("server");
-			rm("vary");
-			rm("etag");
-			rm("x-cdn");
-			rm("x-cdn-client-region");
-			rm("x-cdn-name");
-			rm("x-cdn-server-region");
-			rm("x-reddit-cdn");
-			rm("x-reddit-video-features");
-			rm("Nel");
-			rm("Report-To");
+	for key in [
+		"access-control-expose-headers",
+		"server",
+		"vary",
+		"etag",
+		"x-cdn",
+		"x-cdn-client-region",
+		"x-cdn-name",
+		"x-cdn-server-region",
+		"x-reddit-cdn",
+		"x-reddit-video-features",
+		"nel",
+		"report-to",
+	] {
+		parts.headers.remove(key);
+	}
 
-			res.into_hyper_response()
-		})
-		.map_err(|e| e.to_string())
+	Ok(HyperResponse::from_parts(parts, body))
 }
 
 /// Fetch a server-rendered HTML fragment from Reddit's web frontend.
@@ -310,7 +207,7 @@ pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<S
 	}
 
 	warn!("Reddit rate limited the shreddit session, starting a new one");
-	SHREDDIT_SESSION.clear();
+	clear_cookies();
 	shreddit_request(&path, cursor.as_deref())
 		.await?
 		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
@@ -320,13 +217,7 @@ pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<S
 async fn shreddit_request(path: &str, cursor: Option<&str>) -> Result<Option<String>, String> {
 	let url = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
 
-	let mut builder = match cursor {
-		Some(cursor) => CLIENT
-			.post(&url)
-			.header(wreq_header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-			.body(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish()),
-		None => CLIENT.get(&url),
-	};
+	let mut headers: Vec<(String, String)> = Vec::new();
 
 	// The shreddit endpoints are served by the web frontend, but Reddit answers
 	// 403 with its HTML block page unless the request carries the anonymous app
@@ -337,60 +228,96 @@ async fn shreddit_request(path: &str, cursor: Option<&str>) -> Result<Option<Str
 			if key.eq_ignore_ascii_case("content-type") {
 				continue;
 			}
-			builder = builder.header(key, value);
+			headers.push((key, value));
 		}
 	}
+	headers.push(("Accept".into(), SHREDDIT_PARTIAL_ACCEPT.into()));
 
-	let response = builder
-		.header(wreq_header::ACCEPT, SHREDDIT_PARTIAL_ACCEPT)
-		.cookie_provider(Arc::clone(&SHREDDIT_SESSION))
-		.send()
+	if let Some(cookies) = cookie_header() {
+		headers.push(("Cookie".into(), cookies));
+	}
+
+	let (method, body) = match cursor {
+		Some(cursor) => (
+			"POST",
+			Some(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish().into_bytes()),
+		),
+		None => ("GET", None),
+	};
+
+	if body.is_some() {
+		headers.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
+	}
+
+	let reply = http::request(method, &url, &headers, body)
 		.await
-		.map_err(|e| format!("Couldn't send request to Reddit: {e} | {path}"))?;
+		.map_err(|e| format!("{e} | {path}"))?;
 
-	let status = response.status();
-	if status == wreq::StatusCode::TOO_MANY_REQUESTS {
+	store_cookies(&reply.headers);
+
+	if reply.status == hyper::StatusCode::TOO_MANY_REQUESTS {
 		return Ok(None);
 	}
-	if !status.is_success() {
-		return Err(format!("Reddit returned {status} | {path}"));
+	if !reply.status.is_success() {
+		return Err(format!("Reddit returned {} | {path}", reply.status));
 	}
 
-	let remaining = response
-		.headers()
+	let remaining = reply
+		.headers
 		.get("x-ratelimit-remaining")
 		.and_then(|value| value.to_str().ok())
 		.and_then(|value| value.parse::<f32>().ok());
 	if remaining.is_some_and(|remaining| remaining < SHREDDIT_RATELIMIT_ROTATE_BELOW) {
 		trace!("Shreddit session rate limit is low ({remaining:?} remaining), starting a new one");
-		SHREDDIT_SESSION.clear();
+		clear_cookies();
 	}
 
-	let body = response.text().await.map_err(|e| format!("Failed receiving body from Reddit: {e} | {path}"))?;
+	let body = reply.text();
 	Ok((!body.contains(SHREDDIT_CHALLENGE_TITLE)).then_some(body))
+}
+
+/// The logged-out shreddit session cookie, as a `Cookie` header value.
+fn cookie_header() -> Option<String> {
+	let session = SHREDDIT_SESSION.lock().ok()?;
+	if session.is_empty() {
+		return None;
+	}
+	Some(session.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; "))
+}
+
+fn store_cookies(headers: &hyper::HeaderMap) {
+	let Ok(mut session) = SHREDDIT_SESSION.lock() else {
+		return;
+	};
+	for value in headers.get_all(hyper::header::SET_COOKIE) {
+		let Ok(value) = value.to_str() else { continue };
+		let Some((pair, _attributes)) = value.split_once(';') else { continue };
+		let Some((name, value)) = pair.split_once('=') else { continue };
+		session.insert(name.trim().to_string(), value.trim().to_string());
+	}
+}
+
+fn clear_cookies() {
+	if let Ok(mut session) = SHREDDIT_SESSION.lock() {
+		session.clear();
+	}
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
-fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<Reply, String>> {
+	request("GET", path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
 }
 
-/// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
-fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::HEAD, path, false, quarantine, base_path, host)
+/// Makes a HEAD request to Reddit at `path`, using the short URL base. This will
+/// not follow redirects.
+fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<Reply, String>> {
+	request("HEAD", path, false, quarantine, base_path, host)
 }
 
-// /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
-// fn reddit_head(path: String, quarantine: bool) -> Boxed<Result<Response<Body>, String>> {
-// 	request(&Method::HEAD, path, false, quarantine, false)
-// }
-// Unused - reddit_head is only ever called in the context of a short URL
-
-/// Makes a request to Reddit. If `redirect` is `true`, `request_with_redirect`
-/// will recurse on the URL that Reddit provides in the Location HTTP header
-/// in its response.
-fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+/// Makes a request to Reddit. If `redirect` is `true`, this will recurse on the
+/// URL that Reddit provides in the Location HTTP header in its response.
+fn request(method: &'static str, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<Reply, String>> {
 	// Keep the logical path unchanged for caches and diagnostics. Reddit blocks
 	// literal anonymous comments routes, so only rewrite the outgoing URL.
 	let transport_path = comments_transport_path(&path);
@@ -418,22 +345,16 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let mut builder = api_client().request(method.clone(), &url);
-
-	for (key, value) in headers {
-		builder = builder.header(key, value);
-	}
-
 	async move {
-		match builder.send().await {
-			Ok(response) => {
+		match http::request(method, &url, &headers, None).await {
+			Ok(reply) => {
 				// Reddit may respond with a 3xx. Decide whether or not to
 				// redirect based on caller params.
-				if response.status().is_redirection() {
+				if reply.status.is_redirection() {
 					if !redirect {
-						return Ok(response);
+						return Ok(reply);
 					};
-					let location_header = response.headers().get(wreq::header::LOCATION);
+					let location_header = reply.headers.get(header::LOCATION);
 					if location_header.and_then(|h| h.to_str().ok()) == Some(ALTERNATIVE_REDDIT_URL_BASE) {
 						return Err("Reddit response was invalid".to_string());
 					}
@@ -469,12 +390,12 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 					.await;
 				};
 
-				Ok(response)
+				Ok(reply)
 			}
 			Err(e) => {
 				dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
 
-				Err(e.to_string())
+				Err(e)
 			}
 		}
 	}
@@ -535,55 +456,8 @@ fn comments_logical_path(path: &str) -> String {
 }
 
 /// Make a request to a Reddit API and parse the JSON response.
-///
-/// Reddit blocklists TLS fingerprints and the list changes without notice, so a
-/// block is retried once with the other fingerprint (see `api_client`) and the
-/// switch is remembered for later requests.
 #[cached(size = 100, time = 30, result = true)]
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
-	let using_emulated = USE_EMULATED_API_CLIENT.load(Ordering::Relaxed);
-
-	match json_with_client(path.clone(), quarantine).await {
-		Ok(value) => Ok(value),
-		Err(JsonFailure { message, blocked: true }) => {
-			warn!(
-				"Reddit blocked the {} TLS fingerprint, retrying with the other one",
-				if using_emulated { "emulated" } else { "plain" }
-			);
-			USE_EMULATED_API_CLIENT.store(!using_emulated, Ordering::Relaxed);
-			match json_with_client(path, quarantine).await {
-				Ok(value) => {
-					warn!("The other TLS fingerprint is not blocked, using it for API requests from now on");
-					Ok(value)
-				}
-				Err(_) => {
-					USE_EMULATED_API_CLIENT.store(using_emulated, Ordering::Relaxed);
-					Err(message)
-				}
-			}
-		}
-		Err(JsonFailure { message, .. }) => Err(message),
-	}
-}
-
-struct JsonFailure {
-	message: String,
-	/// Reddit answered with its HTML block page instead of JSON.
-	blocked: bool,
-}
-
-impl JsonFailure {
-	fn other(message: String) -> Self {
-		Self { message, blocked: false }
-	}
-}
-
-async fn json_with_client(path: String, quarantine: bool) -> Result<Value, JsonFailure> {
-	// Closure to quickly build errors
-	let err = |msg: &str, e: String, path: String| -> Result<Value, JsonFailure> {
-		Err(JsonFailure::other(format!("{msg}: {e} | {path}")))
-	};
-
 	// First, handle rolling over the OAUTH_CLIENT if need be.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
@@ -594,114 +468,97 @@ async fn json_with_client(path: String, quarantine: bool) -> Result<Value, JsonF
 	#[allow(deprecated)] // try_update is newer than the project's MSRV.
 	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1));
 
-	// Fetch the url...
-	match reddit_get(path.clone(), quarantine).await {
-		Ok(response) => {
-			let status = response.status();
+	let reply = reddit_get(path.clone(), quarantine).await?;
+	let status = reply.status;
 
-			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
-				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-				response.headers().get("x-ratelimit-reset").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-				response.headers().get("x-ratelimit-used").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-			) {
-				trace!(
-					"Ratelimit remaining: Header says {remaining}, we have {current_rate_limit}. Resets in {reset}. Rollover: {}. Ratelimit used: {used}",
-					if is_rolling_over { "yes" } else { "no" },
-				);
+	let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
+		reply.headers.get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
+		reply.headers.get("x-ratelimit-reset").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
+		reply.headers.get("x-ratelimit-used").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
+	) {
+		trace!(
+			"Ratelimit remaining: Header says {remaining}, we have {current_rate_limit}. Resets in {reset}. Rollover: {}. Ratelimit used: {used}",
+			if is_rolling_over { "yes" } else { "no" },
+		);
 
-				// If can parse remaining as a float, round to a u16 and save
-				if let Ok(val) = remaining.parse::<f32>() {
-					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
+		// If can parse remaining as a float, round to a u16 and save
+		if let Ok(val) = remaining.parse::<f32>() {
+			OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
+		}
+
+		Some(reset)
+	} else {
+		None
+	};
+
+	if reply.body.is_empty() {
+		// Rate limited, so spawn a force_refresh_token()
+		tokio::spawn(force_refresh_token());
+		return match reset {
+			Some(val) => Err(format!(
+				"Reddit rate limit exceeded. Try refreshing in a few seconds.\
+				 Rate limit will reset in: {val}"
+			)),
+			None => Err("Reddit rate limit exceeded".to_string()),
+		};
+	}
+
+	// Parse the response from Reddit as JSON
+	match serde_json::from_slice::<Value>(&reply.body) {
+		Ok(json) => {
+			// If user is suspended
+			if let Some(data) = json.get("data") {
+				if let Some(is_suspended) = data.get("is_suspended").and_then(Value::as_bool) {
+					if is_suspended {
+						return Err("suspended".into());
+					}
+				}
+			}
+
+			// If Reddit returned an error
+			if json["error"].is_i64() {
+				// OAuth token has expired; http status 401
+				if json["message"] == "Unauthorized" {
+					error!("Forcing a token refresh");
+					let () = force_refresh_token().await;
+					return Err("OAuth token has expired. Please refresh the page!".to_string());
 				}
 
-				Some(reset)
+				// Handle quarantined
+				if json["reason"] == "quarantined" {
+					return Err("quarantined".into());
+				}
+				// Handle gated
+				if json["reason"] == "gated" {
+					return Err("gated".into());
+				}
+				// Handle private subs
+				if json["reason"] == "private" {
+					return Err("private".into());
+				}
+				// Handle banned subs
+				if json["reason"] == "banned" {
+					return Err("banned".into());
+				}
+
+				Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
 			} else {
-				None
-			};
-
-			// asynchronously aggregate the chunks of the body
-			match hyper::body::aggregate(response.into_hyper_response()).await {
-				Ok(body) => {
-					let has_remaining = body.has_remaining();
-
-					if !has_remaining {
-						// Rate limited, so spawn a force_refresh_token()
-						tokio::spawn(force_refresh_token());
-						return match reset {
-							Some(val) => Err(JsonFailure::other(format!(
-								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
-								 Rate limit will reset in: {val}"
-							))),
-							None => Err(JsonFailure::other("Reddit rate limit exceeded".to_string())),
-						};
-					}
-
-					// Parse the response from Reddit as JSON
-					match serde_json::from_reader(body.reader()) {
-						Ok(value) => {
-							let json: Value = value;
-
-							// If user is suspended
-							if let Some(data) = json.get("data") {
-								if let Some(is_suspended) = data.get("is_suspended").and_then(Value::as_bool) {
-									if is_suspended {
-										return Err(JsonFailure::other("suspended".into()));
-									}
-								}
-							}
-
-							// If Reddit returned an error
-							if json["error"].is_i64() {
-								// OAuth token has expired; http status 401
-								if json["message"] == "Unauthorized" {
-									error!("Forcing a token refresh");
-									let () = force_refresh_token().await;
-									return Err(JsonFailure::other("OAuth token has expired. Please refresh the page!".to_string()));
-								}
-
-								// Handle quarantined
-								if json["reason"] == "quarantined" {
-									return Err(JsonFailure::other("quarantined".into()));
-								}
-								// Handle gated
-								if json["reason"] == "gated" {
-									return Err(JsonFailure::other("gated".into()));
-								}
-								// Handle private subs
-								if json["reason"] == "private" {
-									return Err(JsonFailure::other("private".into()));
-								}
-								// Handle banned subs
-								if json["reason"] == "banned" {
-									return Err(JsonFailure::other("banned".into()));
-								}
-
-								Err(JsonFailure::other(format!(
-									"Reddit error {} \"{}\": {} | {path}",
-									json["error"], json["reason"], json["message"]
-								)))
-							} else {
-								Ok(json)
-							}
-						}
-						Err(e) => {
-							error!("Got an invalid response from reddit {e}. Status code: {status}");
-							if status.is_server_error() {
-								Err(JsonFailure::other("Reddit is having issues, check if there's an outage".to_string()))
-							} else {
-								Err(JsonFailure {
-									message: format!("Failed to parse page JSON data: {e} | {path}"),
-									// The body was not JSON at all: Reddit served its block page.
-									blocked: status == wreq::StatusCode::FORBIDDEN,
-								})
-							}
-						}
-					}
-				}
-				Err(e) => err("Failed receiving body from Reddit", e.to_string(), path),
+				Ok(json)
 			}
 		}
-		Err(e) => err("Couldn't send request to Reddit", e, path),
+		Err(e) => {
+			error!("Got an invalid response from reddit {e}. Status code: {status}");
+			if status.is_server_error() {
+				Err("Reddit is having issues, check if there's an outage".to_string())
+			} else if status == hyper::StatusCode::FORBIDDEN {
+				// The body was Reddit's HTML block page rather than JSON.
+				Err(format!(
+					"Reddit refused this request (403 Forbidden). This endpoint is not available to anonymous clients, so Redlib cannot load it right now. | {path}"
+				))
+			} else {
+				Err(format!("Failed to parse page JSON data: {e} | {path}"))
+			}
+		}
 	}
 }
 
@@ -740,63 +597,12 @@ pub async fn rate_limit_check() -> Result<(), String> {
 	Ok(())
 }
 
-trait IntoHyperResponse {
-	fn into_hyper_response(self) -> HyperResponse<Body>;
-}
-
-impl IntoHyperResponse for WreqResponse {
-	fn into_hyper_response(self) -> HyperResponse<Body> {
-		let status = self.status();
-		let version = self.version();
-
-		let mut builder = HyperResponse::builder().status(status.as_u16()).version(match version {
-			wreq::Version::HTTP_09 => hyper::Version::HTTP_09,
-			wreq::Version::HTTP_10 => hyper::Version::HTTP_10,
-			wreq::Version::HTTP_11 => hyper::Version::HTTP_11,
-			wreq::Version::HTTP_2 => hyper::Version::HTTP_2,
-			wreq::Version::HTTP_3 => hyper::Version::HTTP_3,
-			_ => hyper::Version::HTTP_11,
-		});
-
-		for (name, value) in self.headers() {
-			builder = builder.header(
-				header::HeaderName::from_bytes(name.as_str().as_bytes()).unwrap(),
-				header::HeaderValue::from_bytes(value.as_bytes()).unwrap(),
-			);
-		}
-
-		builder.body(Body::wrap_stream(self.bytes_stream())).unwrap()
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
-
-	#[test]
-	fn test_api_client_follows_the_block_switch() {
-		// `json` flips this flag when Reddit blocks a fingerprint; the next
-		// request has to go out with the other client.
-		LazyLock::force(&API_CLIENT_INIT);
-
-		USE_EMULATED_API_CLIENT.store(false, Ordering::Relaxed);
-		assert_eq!(api_client() as *const WreqClient, &*CLIENT as *const WreqClient);
-
-		USE_EMULATED_API_CLIENT.store(true, Ordering::Relaxed);
-		assert_eq!(api_client() as *const WreqClient, &*EMULATED_CLIENT as *const WreqClient);
-
-		USE_EMULATED_API_CLIENT.store(false, Ordering::Relaxed);
-	}
-
-	#[test]
-	fn test_reddit_dns_name_uses_fastly_dualstack_alias() {
-		assert_eq!(reddit_dns_name("www.reddit.com"), ALTERNATIVE_REDDIT_DNS_HOST);
-		assert_eq!(reddit_dns_name("WWW.REDDIT.COM"), ALTERNATIVE_REDDIT_DNS_HOST);
-		assert_eq!(reddit_dns_name("oauth.reddit.com"), "oauth.reddit.com");
-	}
 
 	#[test]
 	fn test_comments_transport_path_encodes_scoped_and_short_routes() {
