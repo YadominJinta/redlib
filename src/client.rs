@@ -548,6 +548,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		}
 		Err(e) => {
 			error!("Got an invalid response from reddit {e}. Status code: {status}");
+			if status == hyper::StatusCode::FORBIDDEN && crate::gql::handles(&path) {
+				// Reddit blocks these listings on the JSON API but serves them
+				// over GraphQL.
+				trace!("Falling back to GraphQL for {path}");
+				return crate::gql::listing(path).await;
+			}
 			if status.is_server_error() {
 				Err("Reddit is having issues, check if there's an outage".to_string())
 			} else if status == hyper::StatusCode::FORBIDDEN {
