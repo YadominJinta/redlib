@@ -1,8 +1,9 @@
 #![allow(clippy::cmp_owned)]
+//! Post pages: the post itself from the API, its comment tree from GraphQL.
+
 use crate::client::json;
 use crate::config::get_setting;
 use crate::server::RequestExt;
-use crate::shreddit;
 use crate::subreddit::{can_access_quarantine, quarantine};
 use crate::utils::{
 	error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Flair, FlairPart, Post, Preferences,
@@ -41,8 +42,9 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let single_thread = req.param("comment_id").is_some();
 	let highlighted_comment = &req.param("comment_id").unwrap_or_default();
 
-	// Reddit blocks the comments API for anonymous clients, so fetch the post
-	// by ID and its comments from the web frontend.
+	// Reddit blocks the comments API (`/comments/<id>.json`, `/api/morechildren`)
+	// for anonymous clients, so the post comes from the API by id and its comment
+	// tree from the app's GraphQL API.
 	match json(format!("/by_id/t3_{id}.json?raw_json=1"), quarantined).await {
 		Ok(response) => {
 			let post_json = &response["data"]["children"][0];
@@ -60,7 +62,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 			}
 
-			let comments_json = match shreddit::comments(post.community.clone(), id, req.param("comment_id"), sort.clone(), param(&url, "context")).await {
+			let comments_json = match crate::gql::comments(&id, &sort, 8).await {
 				Ok(comments_json) => comments_json,
 				Err(msg) => return error(req, &msg).await,
 			};
@@ -244,5 +246,63 @@ fn build_comment(
 		is_filtered,
 		more_count,
 		prefs: Preferences::new(req),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde_json::json;
+
+	fn test_request() -> Request<Body> {
+		Request::builder().uri("/r/rust/comments/abc/").body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn test_parse_comments_accepts_the_graphql_shape() {
+		// The nested `Listing` built by `gql::comment_listing` has to feed
+		// `parse_comments` unchanged: it indexes both halves of `parent_id`,
+		// reads `replies` as an object and renders `body_html`.
+		let forest: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+			"trees": [
+				{ "depth": 0, "parentId": null, "node": {
+					"id": "t1_root", "parentId": "t3_abc", "authorInfo": { "name": "alice" },
+					"content": { "markdown": "**root**" }, "score": 5,
+					"createdAt": "2026-11-02T08:54:01.000000+0000", "distinguishedAs": "MODERATOR", "isStickied": true
+				} },
+				{ "depth": 1, "parentId": "t1_root", "node": {
+					"id": "t1_child", "parentId": "t1_root", "authorInfo": { "name": "bob" },
+					"content": { "markdown": "child" }, "score": 1,
+					"createdAt": "2026-11-02T08:55:01.000000+0000"
+				} },
+				{ "depth": 1, "parentId": "t1_root", "more": { "count": 7, "cursor": "c1" } }
+			]
+		}))
+		.unwrap();
+
+		let listing = crate::gql::comment_listing(&forest);
+		let req = test_request();
+		let comments = parse_comments(&listing, "/r/rust/comments/abc/", "op", "child", &HashSet::new(), &req);
+
+		assert_eq!(comments.len(), 1, "one root comment");
+		let root = &comments[0];
+		assert_eq!(root.id, "root");
+		assert_eq!(root.parent_id, "abc");
+		assert_eq!(root.author.name, "alice");
+		assert_eq!(root.author.distinguished, "moderator");
+		assert!(root.body.contains("<strong>root</strong>"));
+		// Stickied moderator comments are collapsed unless highlighted.
+		assert!(root.collapsed);
+		assert_eq!(root.replies.len(), 2, "a nested comment and a more-stub");
+
+		let child = &root.replies[0];
+		assert_eq!(child.id, "child");
+		assert_eq!(child.parent_kind, "t1");
+		assert!(child.highlighted, "the permalink's comment is highlighted");
+		assert_eq!(child.replies.len(), 0);
+
+		let more = &root.replies[1];
+		assert_eq!(more.kind, "more");
+		assert_eq!(more.more_count, 7);
 	}
 }

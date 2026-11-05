@@ -71,9 +71,25 @@ pub struct Oauth {
 impl Oauth {
 	/// Create a new OAuth client
 	pub(crate) async fn new() -> Self {
+		Self::new_with_session(HashMap::new()).await
+	}
+
+	/// Headers that identify this logged-out session. Reddit hands the `x-reddit-loid`
+	/// out once and expects it back on later requests, so a token rollover has to keep
+	/// it: a client whose loid changes on every refresh has no history at all.
+	pub(crate) fn session_headers(&self) -> HashMap<String, String> {
+		self.headers_map
+			.iter()
+			.filter(|(key, _)| key.eq_ignore_ascii_case("x-reddit-loid") || key.eq_ignore_ascii_case("x-reddit-session"))
+			.map(|(key, value)| (key.clone(), value.clone()))
+			.collect()
+	}
+
+	/// Create a new OAuth client, reusing the session headers of a previous one.
+	pub(crate) async fn new_with_session(session: HashMap<String, String>) -> Self {
 		// Try MobileSpoofAuth first, then fall back to GenericWebAuth
 		let mut failure_count = 0;
-		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(session.clone()));
 
 		loop {
 			let attempt = Self::new_with_timeout_with_backend(backend.clone()).await;
@@ -102,7 +118,7 @@ impl Oauth {
 			// Switch to GenericWeb after 5 failures with MobileSpoof
 			if matches!(backend, OauthBackendImpl::MobileSpoof(_)) && failure_count >= 5 {
 				warn!("[🔄] MobileSpoofAuth failed 5 times. Falling back to GenericWebAuth...");
-				backend = OauthBackendImpl::GenericWeb(GenericWebAuth::new());
+				backend = OauthBackendImpl::GenericWeb(GenericWebAuth::new(session.clone()));
 			}
 
 			// Crash after 10 total failures
@@ -180,7 +196,10 @@ pub async fn force_refresh_token() {
 	}
 
 	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
-	let new_client = Oauth::new().await;
+	// Keep the loid/session of the client being replaced: the token is new, the
+	// device is supposed to be the same one.
+	let session = OAUTH_CLIENT.load_full().session_headers();
+	let new_client = Oauth::new_with_session(session).await;
 	OAUTH_CLIENT.swap(new_client.into());
 	OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
 	OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
@@ -202,10 +221,10 @@ pub struct MobileSpoofAuth {
 }
 
 impl MobileSpoofAuth {
-	fn new() -> Self {
+	fn new(session: HashMap<String, String>) -> Self {
 		Self {
 			device: Device::new(),
-			additional_headers: HashMap::new(),
+			additional_headers: session,
 		}
 	}
 }
@@ -304,7 +323,7 @@ pub struct GenericWebAuth {
 }
 
 impl GenericWebAuth {
-	fn new() -> Self {
+	fn new(session: HashMap<String, String>) -> Self {
 		// Generate random 20-character alphanumeric device_id
 		let device_id: String = (0..20)
 			.map(|_| {
@@ -319,7 +338,7 @@ impl GenericWebAuth {
 		Self {
 			device_id,
 			user_agent: fake_user_agent::get_rua().to_owned(),
-			additional_headers: HashMap::new(),
+			additional_headers: session,
 		}
 	}
 }
@@ -418,31 +437,41 @@ impl OauthBackend for GenericWebAuth {
 
 impl Device {
 	fn android() -> Self {
-		// Generate uuid
+		// Generate uuid. The app uses `UUID.randomUUID()` for the install id and sends
+		// the same value as both `x-reddit-device-id` and `Client-Vendor-ID`.
 		let uuid = uuid::Uuid::new_v4().to_string();
 
-		// Generate random user-agent
+		// `Device-Name` is `Build.MANUFACTURER;Build.MODEL`, and the
+		// dpr/width/height triplet is that screen's values in dp (u6o.java).
+		let (device_name, dpr, width, height, first_release) = choose_device();
+
+		// Generate a user-agent that matches the shipped build this client models.
+		// `R.string.fmt_user_agent` is `Reddit/Version %1$s/Build %2$s/Android %3$s`:
+		// versionName, versionCode and `Build.VERSION.RELEASE`. The release can only
+		// be one the chosen model actually ran, and the app needs 12L (minSdk 32).
 		let android_app_version = choose(ANDROID_APP_VERSION_LIST).to_string();
-		let android_version = fastrand::u8(9..=14);
+		let android_version = fastrand::u8(first_release.max(12)..=16).to_string();
 
 		let android_user_agent = format!("Reddit/{android_app_version}/Android {android_version}");
 
-		let qos = fastrand::u32(1000..=100_000);
-		let qos: f32 = qos as f32 / 1000.0;
-		let qos = format!("{qos:.3}");
+		// `x-reddit-qos` is a key=value pair, not a bare number (uh80.java).
+		let qos = format!("down-rate-mbps={:.3}", fastrand::u32(5_000..=60_000) as f32 / 1000.0);
 
 		let codecs = TextGenerator::new().generate("available-codecs=video/avc, video/hevc{, video/x-vnd.on2.vp9|}");
 
-		// Android device headers
+		// Android device headers, as `NetworkHeaderInterceptor` adds them.
 		let headers: HashMap<String, String> = HashMap::from([
 			("User-Agent".into(), android_user_agent.clone()),
-			("x-reddit-retry".into(), "algo=no-retries".into()),
+			("Client-Vendor-ID".into(), uuid.clone()),
+			("x-reddit-device-id".into(), uuid.clone()),
+			("Device-Name".into(), device_name.to_string()),
+			("x-reddit-dpr".into(), dpr.to_string()),
+			("x-reddit-width".into(), width.to_string()),
+			("x-reddit-height".into(), height.to_string()),
 			("x-reddit-compression".into(), "1".into()),
-			("x-reddit-qos".into(), qos),
-			("x-reddit-media-codecs".into(), codecs),
-			("Content-Type".into(), "application/json; charset=UTF-8".into()),
-			("client-vendor-id".into(), uuid.clone()),
-			("X-Reddit-Device-Id".into(), uuid.clone()),
+			("X-Reddit-QoS".into(), qos),
+			("X-Reddit-Media-Codecs".into(), codecs),
+			("Accept-Language".into(), "en-US,en;q=0.9".into()),
 		]);
 
 		info!("[🔄] Spoofing Android client with headers: {headers:?}, uuid: \"{uuid}\", and OAuth ID \"{REDDIT_ANDROID_OAUTH_CLIENT_ID}\"");
@@ -464,6 +493,28 @@ fn choose<T: Copy>(list: &[T]) -> T {
 	*fastrand::choose_multiple(list.iter(), 1)[0]
 }
 
+/// Real device profiles: (MANUFACTURER;MODEL, density, width dp, height dp, first Android release).
+///
+/// The screen headers are only plausible together, so they are chosen as one
+/// profile instead of three independent random numbers. `first Android release`
+/// keeps the User-Agent's `Android <release>` at or above the version the model
+/// shipped with: a Pixel 7 never ran Android 12, and that pairing is exactly the
+/// kind of combination a real client never produces.
+const ANDROID_DEVICES: &[(&str, &str, u32, u32, u8)] = &[
+	("Google;Pixel 8", "2.625", 412, 915, 14),
+	("Google;Pixel 7", "2.625", 412, 892, 13),
+	("Google;Pixel 7a", "2.625", 412, 892, 13),
+	("samsung;SM-S918B", "2.8125", 384, 855, 13),
+	("samsung;SM-A546B", "2.625", 384, 866, 13),
+	("OnePlus;CPH2449", "3.0", 360, 800, 13),
+	("motorola;moto g84 5G", "2.625", 412, 915, 13),
+	("Xiaomi;2312DRA50G", "2.75", 405, 900, 13),
+];
+
+fn choose_device() -> (&'static str, &'static str, u32, u32, u8) {
+	ANDROID_DEVICES[fastrand::usize(..ANDROID_DEVICES.len())]
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -471,7 +522,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_mobile_spoof_backend() {
 		// Test MobileSpoofAuth backend specifically
-		let mut backend = MobileSpoofAuth::new();
+		let mut backend = MobileSpoofAuth::new(HashMap::new());
 		let response = backend.authenticate().await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
@@ -485,7 +536,7 @@ mod tests {
 	#[ignore = "todolol"]
 	async fn test_generic_web_backend() {
 		// Test GenericWebAuth backend specifically
-		let mut backend = GenericWebAuth::new();
+		let mut backend = GenericWebAuth::new(HashMap::new());
 		let response = backend.authenticate().await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
@@ -523,9 +574,42 @@ mod tests {
 	}
 
 	#[test]
+	fn test_device_profiles_stay_plausible() {
+		for (name, dpr, width, height, first_release) in ANDROID_DEVICES {
+			assert!(name.contains(';'), "{name} must be MANUFACTURER;MODEL");
+			assert!(*width >= 320 && *height >= 480, "{name} screen is implausible");
+			assert!(dpr.parse::<f32>().is_ok(), "{name} density is not a number");
+			// A model cannot be sent with an Android release it never shipped with.
+			assert!(*first_release >= 12, "{name} predates the app's minSdk");
+			assert!(*first_release <= 16, "{name} ships with an unknown release");
+		}
+	}
+
+	#[test]
 	fn test_creating_backends() {
 		// Test that both backends can be created
-		MobileSpoofAuth::new();
-		GenericWebAuth::new();
+		MobileSpoofAuth::new(HashMap::new());
+		GenericWebAuth::new(HashMap::new());
+	}
+
+	#[test]
+	fn test_session_headers_survive_a_rollover() {
+		// The loid identifies the device to Reddit, so a token refresh must reuse it.
+		let mut headers_map = HashMap::new();
+		headers_map.insert("x-reddit-loid".to_string(), "loid-value".to_string());
+		headers_map.insert("x-reddit-session".to_string(), "session-value".to_string());
+		headers_map.insert("Authorization".to_string(), "Bearer token".to_string());
+
+		let previous = Oauth {
+			headers_map,
+			expires_in: 1,
+			backend: OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(HashMap::new())),
+		};
+
+		let session = previous.session_headers();
+		assert_eq!(session.len(), 2);
+		assert_eq!(session.get("x-reddit-loid").map(String::as_str), Some("loid-value"));
+		assert_eq!(session.get("x-reddit-session").map(String::as_str), Some("session-value"));
+		assert!(!session.contains_key("Authorization"));
 	}
 }

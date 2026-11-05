@@ -11,12 +11,10 @@ use hyper::{header, Body, Request as HyperRequest, Response as HyperResponse};
 use log::{error, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
-use std::borrow::Cow;
-use std::collections::HashMap;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
@@ -26,19 +24,6 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
-
-const SHREDDIT_PATH_PREFIX: &str = "/svc/shreddit/";
-// Asks for the bare fragment instead of a full page shell, roughly halving the response.
-const SHREDDIT_PARTIAL_ACCEPT: &str = "text/vnd.reddit.partial+html, text/html;q=0.9";
-// Reddit answers rate-limited shreddit requests with this reCAPTCHA page and a 200 status.
-const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</title>";
-
-// Logged-out reddit.com session shared by shreddit requests. Reddit challenges
-// cookieless clients after about ten requests, but gives each session a budget
-// of a couple hundred requests. It is kept apart from the OAuth API requests on purpose.
-static SHREDDIT_SESSION: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-// Leaves room for the requests already in flight when the session is rotated.
-const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -192,117 +177,6 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	Ok(HyperResponse::from_parts(parts, body))
 }
 
-/// Fetch a server-rendered HTML fragment from Reddit's web frontend.
-///
-/// These are the fragments reddit.com loads for logged-out visitors, so they
-/// are sent without the spoofed OAuth client's headers. A `cursor` turns the
-/// request into the form POST used to expand a "more comments" placeholder.
-pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<String, String> {
-	if !path.starts_with(SHREDDIT_PATH_PREFIX) {
-		return Err(format!("Refusing to fetch non-shreddit path | {path}"));
-	}
-
-	if let Some(body) = shreddit_request(&path, cursor.as_deref()).await? {
-		return Ok(body);
-	}
-
-	warn!("Reddit rate limited the shreddit session, starting a new one");
-	clear_cookies();
-	shreddit_request(&path, cursor.as_deref())
-		.await?
-		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
-}
-
-/// Returns `Ok(None)` when Reddit rate limits or challenges the session.
-async fn shreddit_request(path: &str, cursor: Option<&str>) -> Result<Option<String>, String> {
-	let url = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
-
-	let mut headers: Vec<(String, String)> = Vec::new();
-
-	// The shreddit endpoints are served by the web frontend, but Reddit answers
-	// 403 with its HTML block page unless the request carries the anonymous app
-	// OAuth token (and the spoofed Android device headers that go with it).
-	{
-		let client = OAUTH_CLIENT.load_full();
-		for (key, value) in client.headers_map.clone() {
-			if key.eq_ignore_ascii_case("content-type") {
-				continue;
-			}
-			headers.push((key, value));
-		}
-	}
-	headers.push(("Accept".into(), SHREDDIT_PARTIAL_ACCEPT.into()));
-
-	if let Some(cookies) = cookie_header() {
-		headers.push(("Cookie".into(), cookies));
-	}
-
-	let (method, body) = match cursor {
-		Some(cursor) => (
-			"POST",
-			Some(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish().into_bytes()),
-		),
-		None => ("GET", None),
-	};
-
-	if body.is_some() {
-		headers.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
-	}
-
-	let reply = http::request(method, &url, &headers, body)
-		.await
-		.map_err(|e| format!("{e} | {path}"))?;
-
-	store_cookies(&reply.headers);
-
-	if reply.status == hyper::StatusCode::TOO_MANY_REQUESTS {
-		return Ok(None);
-	}
-	if !reply.status.is_success() {
-		return Err(format!("Reddit returned {} | {path}", reply.status));
-	}
-
-	let remaining = reply
-		.headers
-		.get("x-ratelimit-remaining")
-		.and_then(|value| value.to_str().ok())
-		.and_then(|value| value.parse::<f32>().ok());
-	if remaining.is_some_and(|remaining| remaining < SHREDDIT_RATELIMIT_ROTATE_BELOW) {
-		trace!("Shreddit session rate limit is low ({remaining:?} remaining), starting a new one");
-		clear_cookies();
-	}
-
-	let body = reply.text();
-	Ok((!body.contains(SHREDDIT_CHALLENGE_TITLE)).then_some(body))
-}
-
-/// The logged-out shreddit session cookie, as a `Cookie` header value.
-fn cookie_header() -> Option<String> {
-	let session = SHREDDIT_SESSION.lock().ok()?;
-	if session.is_empty() {
-		return None;
-	}
-	Some(session.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; "))
-}
-
-fn store_cookies(headers: &hyper::HeaderMap) {
-	let Ok(mut session) = SHREDDIT_SESSION.lock() else {
-		return;
-	};
-	for value in headers.get_all(hyper::header::SET_COOKIE) {
-		let Ok(value) = value.to_str() else { continue };
-		let Some((pair, _attributes)) = value.split_once(';') else { continue };
-		let Some((name, value)) = pair.split_once('=') else { continue };
-		session.insert(name.trim().to_string(), value.trim().to_string());
-	}
-}
-
-fn clear_cookies() {
-	if let Ok(mut session) = SHREDDIT_SESSION.lock() {
-		session.clear();
-	}
-}
-
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<Reply, String>> {
@@ -318,10 +192,7 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// Makes a request to Reddit. If `redirect` is `true`, this will recurse on the
 /// URL that Reddit provides in the Location HTTP header in its response.
 fn request(method: &'static str, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<Reply, String>> {
-	// Keep the logical path unchanged for caches and diagnostics. Reddit blocks
-	// literal anonymous comments routes, so only rewrite the outgoing URL.
-	let transport_path = comments_transport_path(&path);
-	let url = format!("{base_path}{transport_path}");
+	let url = format!("{base_path}{path}");
 
 	let mut headers: Vec<(String, String)> = vec![
 		("Host".into(), host.into()),
@@ -402,42 +273,6 @@ fn request(method: &'static str, path: String, redirect: bool, quarantine: bool,
 	.boxed()
 }
 
-/// Encode one separator in comments API routes to avoid Reddit's anonymous
-/// request block while leaving every other path and the query string intact.
-fn comments_transport_path(path: &str) -> Cow<'_, str> {
-	let base = path.split('?').next().unwrap_or(path);
-	let (separator, tail) = if let Some(tail) = base.strip_prefix("/comments/") {
-		("/comments".len(), tail)
-	} else if let Some(scoped) = base.strip_prefix("/r/") {
-		let Some((subreddit, rest)) = scoped.split_once('/') else {
-			return Cow::Borrowed(path);
-		};
-		let Some(tail) = rest.strip_prefix("comments/") else {
-			return Cow::Borrowed(path);
-		};
-		if subreddit.is_empty() {
-			return Cow::Borrowed(path);
-		}
-		("/r/".len() + subreddit.len(), tail)
-	} else {
-		return Cow::Borrowed(path);
-	};
-
-	let tail = tail.strip_suffix(".json").unwrap_or(tail).trim_end_matches('/');
-	let mut segments = tail.split('/');
-	let Some(post_id) = segments.next() else {
-		return Cow::Borrowed(path);
-	};
-	let _slug = segments.next();
-	let comment_id = segments.next();
-
-	if post_id.is_empty() || comment_id.is_some_and(str::is_empty) || segments.next().is_some() {
-		return Cow::Borrowed(path);
-	}
-
-	Cow::Owned(format!("{}%2F{}", &path[..separator], &path[separator + 1..]))
-}
-
 /// Remove the comments-route separator encoding if Reddit reflects our
 /// transport-only rewrite in a redirect.
 fn comments_logical_path(path: &str) -> String {
@@ -458,6 +293,17 @@ fn comments_logical_path(path: &str) -> String {
 /// Make a request to a Reddit API and parse the JSON response.
 #[cached(size = 100, time = 30, result = true)]
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
+	// The app's own API serves this data over GraphQL, and Reddit keeps closing
+	// the matching JSON endpoints to anonymous clients. Ask GraphQL first, so a
+	// block (or a spent REST quota) cannot break the page; REST stays as the
+	// fallback for anything GraphQL cannot answer.
+	if crate::gql::handles(&path) {
+		match crate::gql::json(&path, quarantine).await {
+			Ok(value) => return Ok(value),
+			Err(error) => warn!("GraphQL could not serve {path} ({error}), falling back to the JSON API"),
+		}
+	}
+
 	// First, handle rolling over the OAUTH_CLIENT if need be.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
@@ -548,12 +394,6 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		}
 		Err(e) => {
 			error!("Got an invalid response from reddit {e}. Status code: {status}");
-			if status == hyper::StatusCode::FORBIDDEN && crate::gql::handles(&path) {
-				// Reddit blocks these listings on the JSON API but serves them
-				// over GraphQL.
-				trace!("Falling back to GraphQL for {path}");
-				return crate::gql::listing(path).await;
-			}
 			if status.is_server_error() {
 				Err("Reddit is having issues, check if there's an outage".to_string())
 			} else if status == hyper::StatusCode::FORBIDDEN {
@@ -584,6 +424,10 @@ pub async fn rate_limit_check() -> Result<(), String> {
 		return Ok(());
 	}
 
+	// Start from a fresh token, so the counter cannot already have been spent by
+	// earlier requests in this process (the startup call gets a new one anyway).
+	force_refresh_token().await;
+
 	// First, check a subreddit.
 	self_check("reddit").await?;
 	// This will reduce the rate limit to 99. Assert this check.
@@ -610,45 +454,7 @@ mod tests {
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
 
-	#[test]
-	fn test_comments_transport_path_encodes_scoped_and_short_routes() {
-		for (path, expected) in [
-			(
-				"/r/rust/comments/18t5968/title/.json?sort=new&raw_json=1",
-				"/r/rust%2Fcomments/18t5968/title/.json?sort=new&raw_json=1",
-			),
-			("/r/rust/comments/18t5968/_/kfbqlbc.json?context=3", "/r/rust%2Fcomments/18t5968/_/kfbqlbc.json?context=3"),
-			("/comments/18t5968.json?raw_json=1", "/comments%2F18t5968.json?raw_json=1"),
-			("/comments/18t5968/_/kfbqlbc.json?context=3", "/comments%2F18t5968/_/kfbqlbc.json?context=3"),
-			("/r/comments/comments/18t5968.json", "/r/comments%2Fcomments/18t5968.json"),
-		] {
-			assert_eq!(comments_transport_path(path), expected);
-			assert_eq!(comments_transport_path(expected), expected, "encoding must be idempotent");
-		}
-	}
 
-	#[test]
-	fn test_comments_transport_path_preserves_other_routes_and_queries() {
-		for path in [
-			"/r/popular/hot.json?after=t3_abc",
-			"/r/rust/comments.json",
-			"/r/rust/commentsXYZ/abc.json",
-			"/r/rust/wiki/comments/abc.json",
-			"/r//comments/abc.json",
-			"/comments/.json",
-			"/comments.json",
-			"/user/example/comments.json",
-			"/user/example/comments/abc.json",
-			"/search.json?q=/r/rust/comments/abc",
-			"https://example.com/r/rust/comments/abc.json",
-			"//example.com/r/rust/comments/abc.json",
-		] {
-			assert!(matches!(comments_transport_path(path), Cow::Borrowed(_)), "{path}");
-		}
-
-		let path = "/r/rust/comments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top";
-		assert_eq!(comments_transport_path(path), "/r/rust%2Fcomments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top");
-	}
 
 	#[test]
 	fn test_comments_logical_path_removes_transport_encoding() {
@@ -662,13 +468,6 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
-	async fn test_shreddit_fragment_rejects_other_paths() {
-		for path in ["/api/v1/me", "https://evil.example/svc/shreddit/x", "/svc/shreddit"] {
-			let error = shreddit_fragment(path.to_string(), None).await.unwrap_err();
-			assert!(error.starts_with("Refusing to fetch non-shreddit path"), "{path}: {error}");
-		}
-	}
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_rate_limit_check() {
 		rate_limit_check().await.unwrap();
