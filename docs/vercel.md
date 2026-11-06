@@ -135,6 +135,9 @@ requests (not implemented here — see §8) most of it could be CDN hits instead
 
 ## 9. Honest comparison
 
+See also [`serverless-platforms.md`](serverless-platforms.md) for the Cloudflare Workers / Netlify /
+Cloudflare Containers comparison and the `wasm32-unknown-unknown` build evidence.
+
 | Host | Effort | Notes |
 |---|---|---|
 | **Fly.io / Railway / Render / a VPS** | **zero code change** | the existing Dockerfile runs as-is; long-lived process, one token, warm caches. This is the right answer for a real instance. |
