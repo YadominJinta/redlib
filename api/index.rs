@@ -1,9 +1,13 @@
-//! Vercel entry point.
+//! Vercel entry point (`api/index.rs`).
 //!
-//! Vercel's Rust runtime does not require a special handler type: it starts the
-//! process with `VERCEL_DEV_PORT` and a Unix socket in `VERCEL_IPC_PATH`, waits
-//! for the process to serve HTTP on `127.0.0.1:<port>` and to announce itself
-//! with a NUL-terminated JSON message, then proxies invocations to it.
+//! Vercel's Rust runtime builds every `[[bin]]` that points into `api/` and runs
+//! it as one function, so this file is the binary target declared in
+//! `Cargo.toml`; the catch-all rewrite in `vercel.json` sends every path here.
+//!
+//! The runtime does not require a handler type: it starts the process with
+//! `VERCEL_DEV_PORT` and a Unix socket in `VERCEL_IPC_PATH`, waits for the process
+//! to serve HTTP on `127.0.0.1:<port>` and to announce itself with a
+//! NUL-terminated JSON message, then proxies invocations to it.
 //!
 //! That is exactly what redlib already is — an HTTP server — so this binary only
 //! adds the announcement and reuses the very same route table as `redlib`.

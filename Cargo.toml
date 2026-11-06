@@ -67,6 +67,12 @@ webpki-roots = "0.26"
 lipsum = "0.9.0"
 sealed_test = "1.0.0"
 
+# Vercel runs each `api/*.rs` binary as a function, and needs the bin declared
+# explicitly because it lives outside `src/`. See docs/vercel.md.
+[[bin]]
+name = "vercel"
+path = "api/index.rs"
+
 [profile.release]
 codegen-units = 1
 lto = true

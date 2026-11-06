@@ -20,8 +20,9 @@ rewrite:
 
 - `src/app.rs` — the route table + static responses, moved out of `main.rs` so the
   server binary and the function binary share one definition (no behaviour change).
-- `src/bin/vercel.rs` — ~90 lines: read the port, warm the statics, serve `app()`,
-  announce itself on the IPC socket.
+- `api/index.rs` — ~95 lines: read the port, warm the statics, serve `app()`, announce
+  itself on the IPC socket. It lives in `api/` because Vercel turns each `api/*.rs`
+  binary target into a function, and is declared as a `[[bin]]` in `Cargo.toml`.
 - no special handler types, no hyper 1.x conversion, no `vercel_runtime` dependency.
 
 Everything else (GraphQL client, token, caches, templates) is untouched.
@@ -31,13 +32,13 @@ Everything else (GraphQL client, token, caches, templates) is untouched.
 | Area | Change | Why |
 |---|---|---|
 | `src/main.rs` | route table moved to `src/app.rs` (`pub fn app(hsts)`) | the function binary must build the same routes |
-| `src/bin/vercel.rs` | new: bind `127.0.0.1:$VERCEL_DEV_PORT`, serve, announce | the whole runtime protocol |
+| `api/index.rs` + `[[bin]]` | new: bind `127.0.0.1:$VERCEL_DEV_PORT`, serve, announce | the whole runtime protocol, and the layout Vercel detects |
 | `src/client.rs` | `serverless()` / `serverless_media_redirect()` helpers | detect Vercel by `VERCEL_DEV_PORT` |
 | `src/client.rs` | 302 to the CDN for `/img`, `/vid`, `/preview`, … in serverless mode | a function response is capped at a few MiB; a video does not fit |
 | `src/client.rs` | refresh the token when it went stale | a frozen process can thaw with an expired token |
 | `src/oauth.rs` | `Oauth::is_stale()` (expiry instant, 2 min margin) | same |
 | `src/app.rs` | CSP widened for the media hosts when redirecting | otherwise the browser blocks the redirected media |
-| `src/bin/vercel.rs` | startup rate-limit check is opt-in (`REDLIB_SERVERLESS_RATE_CHECK=on`) | it is four extra requests on every cold start |
+| `api/index.rs` | startup rate-limit check is opt-in (`REDLIB_SERVERLESS_RATE_CHECK=on`) | it is four extra requests on every cold start |
 
 ## 3. Measured on this machine (through a proxy)
 
@@ -105,17 +106,27 @@ requests (not implemented here — see §8) most of it could be CDN hits instead
   `vercel_runtime` 2.4.1's source (`run()` + `ipc::StartMessage`), and the binary serves
   correctly on that protocol locally, but the deploy path (build image, `vercel-rust`
   runtime picking the `vercel` binary out of the crate, function routing) is untested.
-- The `vercel.json` in this branch is the best guess for the current runtime:
+- The `vercel.json` in this branch, after the first deploy failed with
+  `[unused_function] The pattern "Cargo.toml" defined in functions doesn't match any
+  Serverless Functions inside the api directory`:
 
   ```json
   {
-    "functions": { "Cargo.toml": { "runtime": "vercel-rust@4.0.3", "maxDuration": 10, "memory": 1024 } },
-    "rewrites": [{ "source": "/(.*)", "destination": "/Cargo.toml" }]
+    "functions": { "api/index.rs": { "maxDuration": 30, "memory": 1024 } },
+    "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
   }
   ```
 
-  The older `builds` form (`{"src": "Cargo.toml", "use": "vercel-rust@4.0.3", "config": {"bin": "vercel"}}`)
-  may be what the deployed runtime accepts; check what the dashboard generates.
+  That error is the documented layout: the official Rust runtime builds every
+  `[[bin]]` whose path is inside `api/` (docs require one `[[bin]]` per handler), so
+  the entry had to move from `src/bin/` to `api/index.rs`. No `runtime` key is
+  needed — the community `vercel-rust` builder that needed one is deprecated in
+  favour of this baked-in runtime.
+- Whether the runtime bridge accepts a binary that speaks the protocol itself
+  instead of linking `vercel_runtime`: the messages are copied from that crate's
+  `run()` and `ipc::StartMessage`, but if the deploy builds and then returns 502
+  this is the first thing to change (link the crate and drive `app()` from a
+  `service_fn` handler instead).
 - Whether the build image has a recent enough Rust (repo pins `rust-version = "1.81"`).
 - `.vercelignore` excludes `target/` so the upload is source-only; without it the build
   upload includes a 139 MB debug tree.

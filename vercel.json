@@ -1,11 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "Cargo.toml": {
-      "runtime": "vercel-rust@4.0.3",
-      "maxDuration": 10,
+    "api/index.rs": {
+      "maxDuration": 30,
       "memory": 1024
     }
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/Cargo.toml" }]
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
 }
