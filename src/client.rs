@@ -1,10 +1,10 @@
 use crate::dbg_msg;
+use crate::http::{self, Reply};
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
 use cached::proc_macro::cached;
-use crate::http::{self, Reply};
 use futures_lite::future::block_on;
 use futures_lite::{future::Boxed, FutureExt};
 use hyper::{header, Body, Request as HyperRequest, Response as HyperResponse};
@@ -24,6 +24,24 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
+
+/// Whether this process runs on Vercel, where an invocation is a request and the
+/// process may be frozen between them.
+pub fn serverless() -> bool {
+	std::env::var("VERCEL_DEV_PORT").is_ok_and(|port| !port.is_empty()) || std::env::var("REDLIB_SERVERLESS").is_ok_and(|value| value == "on")
+}
+
+/// Whether media requests should be redirected to Reddit's CDN.
+///
+/// On when running serverless: a function response is capped at a few MiB, so a
+/// video or a large image cannot be streamed through it. The trade-off is that
+/// the browser then talks to Reddit's CDN directly and sees the user's address.
+pub fn serverless_media_redirect() -> bool {
+	match std::env::var("REDLIB_SERVERLESS_MEDIA_REDIRECT") {
+		Ok(value) => value == "on",
+		Err(_) => serverless(),
+	}
+}
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -119,7 +137,8 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 		403 if policy_error => Err("Too many requests.".to_string()),
 
 		_ => Ok(
-			res.headers
+			res
+				.headers
 				.get(header::LOCATION)
 				.map(|val| percent_encode(val.as_bytes(), CONTROLS).to_string().trim_start_matches(REDDIT_URL_BASE).to_string()),
 		),
@@ -133,6 +152,19 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	for (name, value) in &req.params() {
 		// Fill the parameter value in the url
 		url = url.replace(&format!("{{{name}}}"), value);
+	}
+
+	if serverless_media_redirect() {
+		// A function response is capped at a few MiB, and a video does not fit in
+		// it, so hand the client over to Reddit's CDN.
+		return Ok(
+			HyperResponse::builder()
+				.status(302)
+				.header("Location", url)
+				.header("Cache-Control", "public, max-age=300")
+				.body(Body::empty())
+				.unwrap_or_default(),
+		);
 	}
 
 	let mut headers: Vec<(String, String)> = Vec::new();
@@ -314,6 +346,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	#[allow(deprecated)] // try_update is newer than the project's MSRV.
 	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1));
 
+	// The refresh loop only runs while the process is awake; a frozen serverless
+	// process can come back with a token that has already expired.
+	if OAUTH_CLIENT.load_full().is_stale() && !is_rolling_over {
+		force_refresh_token().await;
+	}
+
 	let reply = reddit_get(path.clone(), quarantine).await?;
 	let status = reply.status;
 
@@ -453,8 +491,6 @@ mod tests {
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
-
-
 
 	#[test]
 	fn test_comments_logical_path_removes_transport_encoding() {

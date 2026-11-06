@@ -65,6 +65,8 @@ impl OauthBackend for OauthBackendImpl {
 pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
 	expires_in: u64,
+	/// When the token needs replacing, with a safety margin already applied.
+	expires_at: std::time::Instant,
 	pub(crate) backend: OauthBackendImpl,
 }
 
@@ -78,7 +80,8 @@ impl Oauth {
 	/// out once and expects it back on later requests, so a token rollover has to keep
 	/// it: a client whose loid changes on every refresh has no history at all.
 	pub(crate) fn session_headers(&self) -> HashMap<String, String> {
-		self.headers_map
+		self
+			.headers_map
 			.iter()
 			.filter(|(key, _)| key.eq_ignore_ascii_case("x-reddit-loid") || key.eq_ignore_ascii_case("x-reddit-session"))
 			.map(|(key, value)| (key.clone(), value.clone()))
@@ -143,6 +146,8 @@ impl Oauth {
 			Ok(Self {
 				headers_map,
 				expires_in: response.expires_in,
+				// Refresh two minutes early, as the background loop does.
+				expires_at: std::time::Instant::now() + std::time::Duration::from_secs(response.expires_in.saturating_sub(120)),
 				backend,
 			})
 		})
@@ -151,6 +156,14 @@ impl Oauth {
 
 	pub fn user_agent(&self) -> &str {
 		self.backend.user_agent()
+	}
+
+	/// Whether the token is past its refresh point.
+	///
+	/// The background loop keeps this false on a long-running host; a serverless
+	/// process that was frozen past the expiry has to notice it here instead.
+	pub(crate) fn is_stale(&self) -> bool {
+		std::time::Instant::now() >= self.expires_at
 	}
 }
 
@@ -253,9 +266,7 @@ impl OauthBackend for MobileSpoofAuth {
 		trace!("Sending token request to {url}...");
 
 		// Send request
-		let resp = crate::http::request("POST", &url, &headers, Some(body.into_bytes()))
-			.await
-			.map_err(AuthError::Http)?;
+		let resp = crate::http::request("POST", &url, &headers, Some(body.into_bytes())).await.map_err(AuthError::Http)?;
 
 		trace!("Received response with status {} and length {:?}", resp.status, resp.headers.get("content-length"));
 		trace!("OAuth headers: {:#?}", resp.headers);
@@ -271,7 +282,9 @@ impl OauthBackend for MobileSpoofAuth {
 
 		// Same with x-reddit-session
 		if let Some(header) = resp.headers.get("x-reddit-session") {
-			self.additional_headers.insert("x-reddit-session".to_owned(), header.to_str().unwrap_or_default().to_string());
+			self
+				.additional_headers
+				.insert("x-reddit-session".to_owned(), header.to_str().unwrap_or_default().to_string());
 		}
 
 		trace!("Serializing response...");
@@ -366,9 +379,7 @@ impl OauthBackend for GenericWebAuth {
 		trace!("Sending GenericWebAuth token request to {url}...");
 
 		// Send request
-		let resp = crate::http::request("POST", url, &headers, Some(body_str.into_bytes()))
-			.await
-			.map_err(AuthError::Http)?;
+		let resp = crate::http::request("POST", url, &headers, Some(body_str.into_bytes())).await.map_err(AuthError::Http)?;
 
 		headers.clear();
 
@@ -386,7 +397,9 @@ impl OauthBackend for GenericWebAuth {
 
 		// Same with x-reddit-session
 		if let Some(header) = resp.headers.get("x-reddit-session") {
-			self.additional_headers.insert("x-reddit-session".to_owned(), header.to_str().unwrap_or_default().to_string());
+			self
+				.additional_headers
+				.insert("x-reddit-session".to_owned(), header.to_str().unwrap_or_default().to_string());
 		}
 
 		trace!("Serializing GenericWebAuth response...");
@@ -603,6 +616,7 @@ mod tests {
 		let previous = Oauth {
 			headers_map,
 			expires_in: 1,
+			expires_at: std::time::Instant::now(),
 			backend: OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(HashMap::new())),
 		};
 
