@@ -62,20 +62,10 @@ fake_user_agent = "0.2.2"
 hyper-rustls = { version = "0.25", default-features = false, features = ["ring", "http1", "tls12", "logging"] }
 rustls = { version = "0.22", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "0.26"
-# The Vercel Rust runtime: `api/index.rs` speaks its bridge (hyper 1 types).
-vercel_runtime = { version = "2.4" }
-http-body-util = "0.1"
-http = "1"
 
 [dev-dependencies]
 lipsum = "0.9.0"
 sealed_test = "1.0.0"
-
-# Vercel runs each `api/*.rs` binary as a function, and needs the bin declared
-# explicitly because it lives outside `src/`. See docs/vercel.md.
-[[bin]]
-name = "index"
-path = "api/index.rs"
 
 [profile.release]
 codegen-units = 1

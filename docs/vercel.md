@@ -7,40 +7,44 @@ Vercel account. Read §7 for what is still unverified.
 
 ## 1. TL;DR
 
-Vercel's Rust runtime is not a handler API — it is:
+Vercel's Rust runtime has **two modes**, chosen by whether the crate depends on
+`vercel_runtime` (`packages/rust/src/standalone-server.ts`):
 
-1. start the binary with `VERCEL_DEV_PORT` and a Unix socket in `VERCEL_IPC_PATH`;
-2. the binary serves HTTP on `127.0.0.1:<port>`;
-3. the binary writes one NUL-terminated JSON message to that socket:
-   `{"type":"server-started","payload":{"initDuration":<ms>,"httpPort":<port>}}`;
-4. Vercel proxies invocations into that port, reusing the process while it is warm.
+1. **Handler mode** — the crate depends on `vercel_runtime`; the binary speaks the
+   runtime bridge (`run(service_fn(handler))`, requests and responses tunneled over
+   IPC). This is what the `rust/hello-world` example does.
+2. **Standalone mode** — the crate does *not* depend on it; the binary is treated as a
+   **whole HTTP server**: it is spawned with `$PORT` and everything is proxied to it,
+   with the request path preserved (`ownsRouteTable` + a `/(.*)` catch-all whose
+   `request.path` transform keeps the original path).
 
-That is *exactly* what Redlib already is (a hyper HTTP server), so the port is not a
-rewrite:
+Redlib is already a whole HTTP server, and its CLI reads `PORT` from the environment, so
+the deploy target is **mode 2 with zero entry-point code**:
 
-- `src/app.rs` — the route table + static responses, moved out of `main.rs` so the
-  server binary and the function binary share one definition (no behaviour change).
-- `api/index.rs` — ~95 lines: read the port, warm the statics, serve `app()`, announce
-  itself on the IPC socket. It lives in `api/` because Vercel turns each `api/*.rs`
-  binary target into a function, and is declared as a `[[bin]]` in `Cargo.toml`.
-- no special handler types, no hyper 1.x conversion, no `vercel_runtime` dependency.
+- no `api/index.rs`, no `vercel_runtime` dependency, no `vercel.json`;
+- the builder picks the binary from `default-run = "redlib"` in `Cargo.toml`
+  (`resolveStandaloneBinary`), compiles it and fronts it with its own proxy;
+- the only code changes are the ones the host needs anyway: media is redirected instead
+  of streamed (a function response is capped), and a frozen process refreshes an expired
+  token; both keyed off `VERCEL` being set.
 
-Everything else (GraphQL client, token, caches, templates) is untouched.
+Getting there took three failed deploys, all documented in §7 — the interesting part is
+that each error pointed at a different assumption about the runtime.
 
 ## 2. What had to change
 
 | Area | Change | Why |
 |---|---|---|
-| `src/main.rs` | route table moved to `src/app.rs` (`pub fn app(hsts)`) | the function binary must build the same routes |
-| `api/index.rs` + `[[bin]]` | new: the function entry, bridging `vercel_runtime`'s hyper 1 request/response to the app's hyper 0.14 types | the layout and the bridge Vercel expects |
-| `src/server.rs` | `Server::handle()` extracted out of `listen()` | the function needs to serve a request without owning a socket |
-| `Cargo.toml` | `vercel_runtime`, `http-body-util`, `http`; `[[bin]] name = "index" path = "api/index.rs"` | the runtime's bridge crate, and a bin whose name matches its file |
-| `src/client.rs` | `serverless()` / `serverless_media_redirect()` helpers | detect Vercel by `VERCEL_DEV_PORT` |
-| `src/client.rs` | 302 to the CDN for `/img`, `/vid`, `/preview`, … in serverless mode | a function response is capped at a few MiB; a video does not fit |
-| `src/client.rs` | refresh the token when it went stale | a frozen process can thaw with an expired token |
-| `src/oauth.rs` | `Oauth::is_stale()` (expiry instant, 2 min margin) | same |
+| `src/app.rs` | the route table and the static responses moved out of `main.rs` into `pub fn app(hsts)` | lets a test, a function or another entry point build the same app |
+| `src/server.rs` | `Server::handle()` extracted from `listen()` | one request can be served without owning a socket; `listen` uses it too |
+| `src/client.rs` | `serverless()` (Vercel/Lambda env), 302 for media, stale-token refresh | a function response is capped at a few MiB, and a frozen process wakes up with an expired token |
+| `src/oauth.rs` | `Oauth::is_stale()` | same |
 | `src/app.rs` | CSP widened for the media hosts when redirecting | otherwise the browser blocks the redirected media |
-| `api/index.rs` | startup rate-limit check is opt-in (`REDLIB_SERVERLESS_RATE_CHECK=on`) | it is four extra requests on every cold start |
+| `.vercelignore` | `target`, `.git` | without it the upload carries a 139 MB debug tree |
+
+Nothing else: no entry point, no `vercel.json`, no runtime crate. The `main.rs` refactor
+is a pure move, and the server binary behaves exactly as before (`cargo test --lib`: 88
+tests, network ones included).
 
 ## 3. Measured on this machine (through a proxy)
 
@@ -102,39 +106,51 @@ Warm invocations are 5–20 ms of CPU, so GB-seconds stay small; the cost driver
 invocations plus the data transferred for the HTML. With `s-maxage` on anonymous
 requests (not implemented here — see §8) most of it could be CDN hits instead.
 
-## 7. What is *not* verified
+## 7. The three failed deploys, and what each one meant
 
-- **An actual `vercel deploy`.** The runtime protocol is implemented from
-  `vercel_runtime` 2.4.1's source (`run()` + `ipc::StartMessage`), and the binary serves
-  correctly on that protocol locally, but the deploy path (build image, `vercel-rust`
-  runtime picking the `vercel` binary out of the crate, function routing) is untested.
-- `vercel.json` is now only a rewrite:
+**1. `functions: { "Cargo.toml": … }`** → `[unused_function] The pattern "Cargo.toml"
+defined in functions doesn't match any Serverless Functions inside the api directory`.
+`functions` only *tunes* a function Vercel has already detected; it never creates one.
 
-  ```json
-  { "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }] }
-  ```
+**2. `functions: { "api/index.rs": … }`** with a hand-written IPC binary → the same
+error, which rules the pattern syntax out: no function was detected at all.
 
-  Two deploys failed before that, both worth remembering:
+**3. No `functions` key, `vercel_runtime` added, entry at `api/index.rs`, bin `index`** →
+detection worked, but the build ran `cargo build --bin main`:
 
-  1. `functions: { "Cargo.toml": … }` → `[unused_function] The pattern "Cargo.toml"
-     defined in functions doesn't match any Serverless Functions inside the api
-     directory`. `functions` only tunes a function Vercel has already detected, and
-     detection works on `api/*.rs`.
-  2. `functions: { "api/index.rs": … }` with a hand-rolled IPC binary → the same
-     error, which is what pointed at the real cause: the official `rust/hello-world`
-     example ships **no `vercel.json` at all**, depends on `vercel_runtime`, uses
-     `run(service_fn(handler))`, and names every `[[bin]]` after its file
-     (`name = "simple"`, `path = "api/simple.rs"`). So the entry now links the crate
-     and the bin is `index` for `api/index.rs`.
-- Whether relaxing `functions` (memory / maxDuration) is possible at all once
-  detection works. The defaults are used for now: 10 s is enough for the slowest
-  page measured (3 s) and 1 GB for the memory footprint (~50 MB).
-- Whether the build image has a recent enough Rust (repo pins `rust-version = "1.81"`).
-- `.vercelignore` excludes `target/` so the upload is source-only; without it the build
-  upload includes a 139 MB debug tree.
-- Vercel's acceptable-use terms for a public proxy instance. Redlib is a proxy in front of
-  Reddit; if that is considered abuse of the free tier the deploy will not survive. Ask
-  before pointing a domain at it.
+```
+error: no bin target named `main` in default-run packages
+help: available bin targets: index, redlib
+```
+
+That one is explained by `findBinaryName()` in `packages/rust/src/lib/cargo.ts`: in
+handler mode it looks up the **detected entrypoint** among the `[[bin]]` paths and, when
+that fails, falls back to the file stem — and detection had picked `src/main.rs` (from
+`default-run = "redlib"`), whose stem is `main`. Declaring `[[bin]] path = "src/main.rs"`
+would have satisfied it, but handler mode is the wrong mode for a server: the binary is
+expected to speak the IPC bridge, not to listen on a port.
+
+**The working shape** is therefore the standalone one: drop `vercel_runtime`, drop the
+`api/` entry, drop `vercel.json`. Then `resolveStandaloneMode` returns true,
+`resolveStandaloneBinary` picks the `default-run` binary (`redlib` → `src/main.rs`),
+`compileCargoBinary` builds it, and `createStandaloneLambda` spawns it with `$PORT`
+behind the shared IPC proxy. Redlib's CLI already reads `PORT`, so it just works.
+
+Verified locally the way that proxy runs it:
+
+```bash
+PORT=3220 VERCEL=1 ./target/debug/redlib    # standalone: one env var, no IPC
+```
+
+### Still unverified
+
+- An actual `vercel deploy` of this shape. Everything above was derived from the builder
+  source and reproduced locally with the same env the proxy uses (`$PORT`), but the
+  Lambda packaging and routing are only exercised on Vercel.
+- Whether `functions: {"src/main.rs": {memory / maxDuration}}` is accepted for tuning; the
+  defaults (10 s, 1 GB) already cover the slowest page measured (3 s) and ~50 MB.
+- Whether the build image's Rust is recent enough (repo pins `rust-version = "1.81"`).
+- Vercel's acceptable-use terms for a public proxy instance.
 
 ## 8. If this goes further
 
@@ -161,10 +177,12 @@ Cloudflare Containers comparison and the `wasm32-unknown-unknown` build evidence
 ## 10. Reproducing locally
 
 ```bash
-# what `vercel dev` does: start the binary on a port, then proxy to it
-VERCEL_DEV_PORT=3000 cargo run --bin index
-curl -s localhost:3000/r/rust | head -20
+# what the standalone proxy does: spawn the server on a port and forward to it
+PORT=3000 VERCEL=1 cargo run
 
-# without REDLIB_SERVERLESS_MEDIA_REDIRECT, media keeps streaming through the proxy
-VERCEL_DEV_PORT=3000 REDLIB_SERVERLESS_MEDIA_REDIRECT=off cargo run --bin index
+# keep media streaming through Redlib (loses the size guarantee, not the privacy)
+PORT=3000 VERCEL=1 REDLIB_SERVERLESS_MEDIA_REDIRECT=off cargo run
 ```
+
+Deploying is `vercel deploy` with no `vercel.json`; `.vercelignore` keeps `target/` out
+of the upload.

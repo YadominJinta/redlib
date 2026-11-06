@@ -25,10 +25,16 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
-/// Whether this process runs on Vercel, where an invocation is a request and the
-/// process may be frozen between them.
+/// Whether this process runs on a serverless host, where an invocation is a
+/// request and the process may be frozen between them.
+///
+/// Vercel sets `VERCEL` in functions and `VERCEL_DEV_PORT` while building or under
+/// `vercel dev`; Lambda's own variable is a second signal. `REDLIB_SERVERLESS=on`
+/// forces it for anything else.
 pub fn serverless() -> bool {
-	std::env::var("VERCEL_DEV_PORT").is_ok_and(|port| !port.is_empty()) || std::env::var("REDLIB_SERVERLESS").is_ok_and(|value| value == "on")
+	let present = |name: &str| std::env::var(name).is_ok_and(|value| !value.is_empty());
+
+	present("VERCEL") || present("VERCEL_DEV_PORT") || present("AWS_LAMBDA_FUNCTION_NAME") || std::env::var("REDLIB_SERVERLESS").is_ok_and(|value| value == "on")
 }
 
 /// Whether media requests should be redirected to Reddit's CDN.
@@ -146,7 +152,10 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 }
 
 pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
-	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
+	let mut url = match req.uri().query() {
+		Some(query) if !query.is_empty() => format!("{format}?{query}"),
+		_ => format.to_string(),
+	};
 
 	// For each parameter in request
 	for (name, value) in &req.params() {
