@@ -172,6 +172,7 @@ pub struct Route<'a> {
 	path: String,
 }
 
+#[derive(Clone)]
 pub struct Server {
 	pub default_headers: HeaderMap,
 	router: Router<fn(Request<Body>) -> BoxResponse>,
@@ -306,78 +307,15 @@ impl Server {
 	pub fn listen(self, addr: &str) -> Boxed<Result<(), hyper::Error>> {
 		let make_svc = make_service_fn(move |_conn| {
 			// For correct borrowing, these values need to be borrowed
-			let router = self.router.clone();
-			let default_headers = self.default_headers.clone();
+			let server = self.clone();
 
 			// This is the `Service` that will handle the connection.
 			// `service_fn` is a helper to convert a function that
 			// returns a Response into a `Service`.
-			// let shared_router = router.clone();
 			async move {
 				Ok::<_, String>(service_fn(move |req: Request<Body>| {
-					let req_headers = req.headers().clone();
-					let def_headers = default_headers.clone();
-
-					// Catch robots.txt-disrespecful bots who still identify themselves
-					// Typically justified as "human triggered" actions.
-					if match config::get_setting("REDLIB_ROBOTS_DISABLE_INDEXING") {
-						Some(val) => val == "on",
-						None => false,
-					} {
-						if let Some(user_agent) = req_headers.get("user-agent") {
-							if let Ok(user_agent_str) = user_agent.to_str() {
-								for banned in BANNED_USER_AGENTS {
-									if user_agent_str.contains(banned) {
-										return new_boilerplate(def_headers, req_headers, 403, Body::from("Forbidden")).boxed();
-									}
-								}
-							}
-						}
-					}
-
-					// Remove double slashes and decode encoded slashes
-					let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
-
-					// Remove trailing slashes
-					if path != "/" && path.ends_with('/') {
-						path.pop();
-					}
-
-					// Replace HEAD with GET for routing
-					let (method, is_head) = match req.method() {
-						&Method::HEAD => (&Method::GET, true),
-						method => (method, false),
-					};
-
-					// Match the visited path with an added route
-					match router.recognize(&format!("/{}{}", method.as_str(), path)) {
-						// If a route was configured for this path
-						Ok(found) => {
-							let mut parammed = req;
-							parammed.set_params(found.params().clone());
-
-							// Run the route's function
-							let func = (found.handler().to_owned().to_owned())(parammed);
-							async move {
-								match func.await {
-									Ok(mut res) => {
-										res.headers_mut().extend(def_headers);
-										if is_head {
-											*res.body_mut() = Body::empty();
-										} else {
-											let _ = compress_response(&req_headers, &mut res).await;
-										}
-
-										Ok(res)
-									}
-									Err(msg) => new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await,
-								}
-							}
-							.boxed()
-						}
-						// If there was a routing error
-						Err(e) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).boxed(),
-					}
+					let server = server.clone();
+					async move { server.handle(req).await }.boxed()
 				}))
 			}
 		});
@@ -403,6 +341,71 @@ impl Server {
 		});
 
 		server.boxed()
+	}
+
+	/// Serves one request: routing, the bot filter, compression and the default
+	/// headers.
+	///
+	/// `listen` uses it per connection, and a serverless entry point can call it
+	/// directly instead of running a socket server.
+	pub async fn handle(&self, req: Request<Body>) -> Result<Response<Body>, String> {
+		let router = self.router.clone();
+		let default_headers = self.default_headers.clone();
+		let req_headers = req.headers().clone();
+		let def_headers = default_headers.clone();
+
+		// Catch robots.txt-disrespectful bots who still identify themselves.
+		// Typically justified as "human triggered" actions.
+		if config::get_setting("REDLIB_ROBOTS_DISABLE_INDEXING").is_some_and(|value| value == "on") {
+			if let Some(user_agent) = req_headers.get("user-agent") {
+				if let Ok(user_agent) = user_agent.to_str() {
+					if BANNED_USER_AGENTS.iter().any(|banned| user_agent.contains(banned)) {
+						return new_boilerplate(def_headers, req_headers, 403, Body::from("Forbidden")).await;
+					}
+				}
+			}
+		}
+
+		// Remove double slashes and decode encoded slashes
+		let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
+
+		// Remove trailing slashes
+		if path != "/" && path.ends_with('/') {
+			path.pop();
+		}
+
+		// Replace HEAD with GET for routing
+		let (method, is_head) = match req.method() {
+			&Method::HEAD => (&Method::GET, true),
+			method => (method, false),
+		};
+
+		// Match the visited path with an added route
+		match router.recognize(&format!("/{}{}", method.as_str(), path)) {
+			// If a route was configured for this path
+			Ok(found) => {
+				let mut parammed = req;
+				parammed.set_params(found.params().clone());
+
+				// Run the route's function
+				let func = (found.handler().to_owned().to_owned())(parammed);
+				match func.await {
+					Ok(mut res) => {
+						res.headers_mut().extend(def_headers);
+						if is_head {
+							*res.body_mut() = Body::empty();
+						} else {
+							let _ = compress_response(&req_headers, &mut res).await;
+						}
+
+						Ok(res)
+					}
+					Err(msg) => new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await,
+				}
+			}
+			// If there was a routing error
+			Err(e) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).await,
+		}
 	}
 }
 

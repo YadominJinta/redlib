@@ -32,7 +32,9 @@ Everything else (GraphQL client, token, caches, templates) is untouched.
 | Area | Change | Why |
 |---|---|---|
 | `src/main.rs` | route table moved to `src/app.rs` (`pub fn app(hsts)`) | the function binary must build the same routes |
-| `api/index.rs` + `[[bin]]` | new: bind `127.0.0.1:$VERCEL_DEV_PORT`, serve, announce | the whole runtime protocol, and the layout Vercel detects |
+| `api/index.rs` + `[[bin]]` | new: the function entry, bridging `vercel_runtime`'s hyper 1 request/response to the app's hyper 0.14 types | the layout and the bridge Vercel expects |
+| `src/server.rs` | `Server::handle()` extracted out of `listen()` | the function needs to serve a request without owning a socket |
+| `Cargo.toml` | `vercel_runtime`, `http-body-util`, `http`; `[[bin]] name = "index" path = "api/index.rs"` | the runtime's bridge crate, and a bin whose name matches its file |
 | `src/client.rs` | `serverless()` / `serverless_media_redirect()` helpers | detect Vercel by `VERCEL_DEV_PORT` |
 | `src/client.rs` | 302 to the CDN for `/img`, `/vid`, `/preview`, … in serverless mode | a function response is capped at a few MiB; a video does not fit |
 | `src/client.rs` | refresh the token when it went stale | a frozen process can thaw with an expired token |
@@ -44,13 +46,13 @@ Everything else (GraphQL client, token, caches, templates) is untouched.
 
 | Thing | Value |
 |---|---|
-| cold start → first 200 on a local page (`/info`) | **581 ms** (includes the OAuth token fetch) |
+| cold start → first 200 on a local page (`/info`) | **574 ms** (includes the OAuth token fetch) |
 | warm request, cached listing | **4–8 ms** |
 | warm request, post page (one `PostComments` round trip) | **1.4 s** |
 | warm request, 444-comment thread | **3.0 s** |
 | media request in serverless mode | **0.7 ms** (302 to the CDN) |
 | debug binary | 139 MB (with symbols) |
-| release binary (`--release --bin vercel`) | **9.9 MB** |
+| release binary (`--release --bin index`) | **9.9 MB** |
 | local release build | 1 min (cold `target/`); expect a few minutes on the first Vercel build |
 
 The cold start is dominated by the token request; after that the process stays warm and
@@ -106,27 +108,27 @@ requests (not implemented here — see §8) most of it could be CDN hits instead
   `vercel_runtime` 2.4.1's source (`run()` + `ipc::StartMessage`), and the binary serves
   correctly on that protocol locally, but the deploy path (build image, `vercel-rust`
   runtime picking the `vercel` binary out of the crate, function routing) is untested.
-- The `vercel.json` in this branch, after the first deploy failed with
-  `[unused_function] The pattern "Cargo.toml" defined in functions doesn't match any
-  Serverless Functions inside the api directory`:
+- `vercel.json` is now only a rewrite:
 
   ```json
-  {
-    "functions": { "api/index.rs": { "maxDuration": 30, "memory": 1024 } },
-    "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
-  }
+  { "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }] }
   ```
 
-  That error is the documented layout: the official Rust runtime builds every
-  `[[bin]]` whose path is inside `api/` (docs require one `[[bin]]` per handler), so
-  the entry had to move from `src/bin/` to `api/index.rs`. No `runtime` key is
-  needed — the community `vercel-rust` builder that needed one is deprecated in
-  favour of this baked-in runtime.
-- Whether the runtime bridge accepts a binary that speaks the protocol itself
-  instead of linking `vercel_runtime`: the messages are copied from that crate's
-  `run()` and `ipc::StartMessage`, but if the deploy builds and then returns 502
-  this is the first thing to change (link the crate and drive `app()` from a
-  `service_fn` handler instead).
+  Two deploys failed before that, both worth remembering:
+
+  1. `functions: { "Cargo.toml": … }` → `[unused_function] The pattern "Cargo.toml"
+     defined in functions doesn't match any Serverless Functions inside the api
+     directory`. `functions` only tunes a function Vercel has already detected, and
+     detection works on `api/*.rs`.
+  2. `functions: { "api/index.rs": … }` with a hand-rolled IPC binary → the same
+     error, which is what pointed at the real cause: the official `rust/hello-world`
+     example ships **no `vercel.json` at all**, depends on `vercel_runtime`, uses
+     `run(service_fn(handler))`, and names every `[[bin]]` after its file
+     (`name = "simple"`, `path = "api/simple.rs"`). So the entry now links the crate
+     and the bin is `index` for `api/index.rs`.
+- Whether relaxing `functions` (memory / maxDuration) is possible at all once
+  detection works. The defaults are used for now: 10 s is enough for the slowest
+  page measured (3 s) and 1 GB for the memory footprint (~50 MB).
 - Whether the build image has a recent enough Rust (repo pins `rust-version = "1.81"`).
 - `.vercelignore` excludes `target/` so the upload is source-only; without it the build
   upload includes a 139 MB debug tree.
@@ -160,9 +162,9 @@ Cloudflare Containers comparison and the `wasm32-unknown-unknown` build evidence
 
 ```bash
 # what `vercel dev` does: start the binary on a port, then proxy to it
-VERCEL_DEV_PORT=3000 cargo run --bin vercel
+VERCEL_DEV_PORT=3000 cargo run --bin index
 curl -s localhost:3000/r/rust | head -20
 
 # without REDLIB_SERVERLESS_MEDIA_REDIRECT, media keeps streaming through the proxy
-VERCEL_DEV_PORT=3000 REDLIB_SERVERLESS_MEDIA_REDIRECT=off cargo run --bin vercel
+VERCEL_DEV_PORT=3000 REDLIB_SERVERLESS_MEDIA_REDIRECT=off cargo run --bin index
 ```
