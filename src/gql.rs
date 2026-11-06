@@ -714,13 +714,25 @@ fn to_post(node: &Map<String, Value>) -> Value {
 	post.insert("stickied".into(), Value::Bool(flag("isStickied")));
 	post.insert("locked".into(), Value::Bool(flag("isLocked")));
 	post.insert("archived".into(), Value::Bool(flag("isArchived")));
-	post.insert("is_gallery".into(), Value::Bool(node.get("gallery").is_some_and(|gallery| !gallery.is_null())));
 	post.insert("link_flair_text".into(), Value::String(nested("flair", "text")));
 	post.insert("author_flair_text".into(), Value::String(nested("authorFlair", "text")));
 	post.insert("distinguished".into(), Value::String(nested("distinguishedAs", "as").to_lowercase()).or_distinguished(node));
 	post.insert("thumbnail".into(), Value::String(thumbnail(node)));
-	post.insert("post_hint".into(), Value::String(text("postHint")));
-	post.insert("preview".into(), preview(node));
+
+	// `Media::parse` reads the JSON API's media fields, so the app's media node is
+	// translated back into that shape here.
+	let domain = text("domain");
+	post.insert("post_hint".into(), Value::String(post_hint(node)));
+	post.insert("preview".into(), legacy_preview(node));
+	post.insert("secure_media".into(), legacy_secure_media(node));
+	post.insert("is_reddit_media_domain".into(), Value::Bool(is_reddit_media_domain(&domain)));
+
+	let gallery = legacy_gallery(node);
+	post.insert("is_gallery".into(), Value::Bool(gallery.is_some()));
+	if let Some((gallery_data, media_metadata)) = gallery {
+		post.insert("gallery_data".into(), gallery_data);
+		post.insert("media_metadata".into(), media_metadata);
+	}
 
 	Value::Object(post)
 }
@@ -757,32 +769,159 @@ fn thumbnail(node: &Map<String, Value>) -> String {
 		.to_string()
 }
 
-/// Shape a GraphQL media node into the `preview`/`secure_media` fields
-/// `Media::parse` understands.
-fn preview(node: &Map<String, Value>) -> Value {
-	let Some(media) = node.get("media").filter(|media| media.is_object()) else {
-		return Value::Null;
-	};
+/// The API's `post_hint`, which `Media::parse` dispatches on before anything else.
+fn post_hint(node: &Map<String, Value>) -> String {
+	let media = node.get("media").filter(|media| media.is_object());
+	let hint = media.and_then(|media| media.get("typeHint")).and_then(Value::as_str).unwrap_or_default();
 
-	let Some(video) = media.get("redditVideo").filter(|video| video.is_object()) else {
-		return Value::Null;
-	};
+	// An animated image takes the image path: `Media::parse` then prefers the mp4
+	// variant and renders it as a `gif`.
+	let animated = media.is_some_and(|media| media.get("animated").is_some_and(|animated| animated.is_object()));
 
-	let mut reddit_video = Map::new();
-	for (from, to) in [
-		("fallbackUrl", "fallback_url"),
-		("hlsUrl", "hls_url"),
-		("dashUrl", "dash_url"),
-		("isGif", "is_gif"),
-		("height", "height"),
-		("width", "width"),
-	] {
-		if let Some(value) = video.get(from) {
-			reddit_video.insert(to.to_string(), value.clone());
+	match (hint, animated) {
+		(_, true) | ("IMAGE", _) => "image",
+		("VIDEO", _) => "hosted:video",
+		("EMBED", _) => "rich:video",
+		_ => "",
+	}
+	.to_string()
+}
+
+/// Reddit-hosted links need no preview to be recognised as media.
+fn is_reddit_media_domain(domain: &str) -> bool {
+	matches!(domain, "i.redd.it" | "v.redd.it" | "preview.redd.it" | "i.reddituploads.com")
+}
+
+/// URL and pixel size of the largest still image, used as the poster.
+fn still_size(node: &Map<String, Value>) -> Option<(String, u64, u64)> {
+	if let Some(source) = node.get("media").and_then(|media| media.get("still")).and_then(|still| still.get("source")) {
+		return Some((
+			source["url"].as_str()?.to_string(),
+			source["dimensions"]["width"].as_u64().unwrap_or_default(),
+			source["dimensions"]["height"].as_u64().unwrap_or_default(),
+		));
+	}
+	// Galleries carry no `media` node; the first item stands in for the poster.
+	let item = node.get("gallery")?.get("items")?.as_array()?.first()?.get("media")?;
+	Some((
+		item["url"].as_str()?.to_string(),
+		item["width"].as_u64().unwrap_or_default(),
+		item["height"].as_u64().unwrap_or_default(),
+	))
+}
+
+/// `preview.images[0]` (plus `variants.mp4` for animations) and the hosted-video
+/// block, in the shape `Media::parse` expects.
+fn legacy_preview(node: &Map<String, Value>) -> Value {
+	let mut preview = Map::new();
+
+	if let Some((url, width, height)) = still_size(node) {
+		let mut image = Map::new();
+		image.insert("source".into(), json!({ "url": url, "width": width, "height": height }));
+
+		if let Some(mp4) = node
+			.get("media")
+			.and_then(|media| media.get("animated"))
+			.and_then(|animated| animated.get("mp4_source"))
+			.filter(|mp4| mp4.is_object())
+		{
+			image.insert(
+				"variants".into(),
+				json!({ "mp4": { "source": {
+					"url": mp4["url"].clone(),
+					"width": mp4["dimensions"]["width"].clone(),
+					"height": mp4["dimensions"]["height"].clone(),
+				} } }),
+			);
+		}
+
+		preview.insert("images".into(), Value::Array(vec![Value::Object(image)]));
+	}
+
+	if let Some(video) = hosted_video(node) {
+		preview.insert("reddit_video_preview".into(), video);
+	}
+
+	if preview.is_empty() { Value::Null } else { Value::Object(preview) }
+}
+
+/// `secure_media.reddit_video`, the other place `Media::parse` looks for videos.
+fn legacy_secure_media(node: &Map<String, Value>) -> Value {
+	hosted_video(node).map_or(Value::Null, |video| json!({ "reddit_video": video }))
+}
+
+/// Reddit-hosted video as `{fallback_url, hls_url, dash_url, is_gif, width, height}`.
+fn hosted_video(node: &Map<String, Value>) -> Option<Value> {
+	let media = node.get("media").filter(|media| media.is_object())?;
+	let packaged = media.get("packagedMedia");
+	let muxed = packaged.and_then(|packaged| packaged.get("muxedMp4s"));
+
+	// Prefer the app's adaptive mp4, then the progressive ones it ships.
+	let fallback = packaged
+		.and_then(|packaged| packaged.get("playbackMp4s"))
+		.and_then(|playback| playback.get("permutations"))
+		.and_then(|permutations| permutations.as_array())
+		.and_then(|permutations| permutations.first())
+		.and_then(|permutation| permutation.get("source"))
+		.and_then(|source| source.get("url"))
+		.and_then(Value::as_str)
+		.or_else(|| muxed.and_then(|muxed| muxed["recommended"]["url"].as_str()))
+		.or_else(|| muxed.and_then(|muxed| muxed["medium"]["url"].as_str()))
+		.or_else(|| muxed.and_then(|muxed| muxed["high"]["url"].as_str()))
+		.or_else(|| muxed.and_then(|muxed| muxed["highest"]["url"].as_str()))
+		.or_else(|| muxed.and_then(|muxed| muxed["low"]["url"].as_str()))?;
+
+	let streaming = media.get("streaming");
+
+	let mut video = Map::new();
+	video.insert("fallback_url".into(), Value::String(fallback.to_string()));
+	for (from, to) in [("hlsUrl", "hls_url"), ("dashUrl", "dash_url"), ("scrubberMediaUrl", "scrubber_media_url")] {
+		if let Some(value) = streaming.and_then(|streaming| streaming[from].as_str()) {
+			video.insert(to.to_string(), Value::String(value.to_string()));
+		}
+	}
+	video.insert("is_gif".into(), Value::Bool(streaming.and_then(|streaming| streaming["isGif"].as_bool()).unwrap_or_default()));
+	for (from, to) in [("width", "width"), ("height", "height")] {
+		if let Some(value) = streaming.and_then(|streaming| streaming["dimensions"][from].as_u64()) {
+			video.insert(to.to_string(), json!(value));
 		}
 	}
 
-	json!({ "reddit_video_preview": Value::Object(reddit_video) })
+	Some(Value::Object(video))
+}
+
+/// `gallery_data.items` + `media_metadata`, as `GalleryMedia::parse` reads them.
+fn legacy_gallery(node: &Map<String, Value>) -> Option<(Value, Value)> {
+	let items = node.get("gallery")?.get("items")?.as_array().filter(|items| !items.is_empty())?;
+
+	let mut gallery_items = Vec::new();
+	let mut metadata = Map::new();
+	for (index, item) in items.iter().enumerate() {
+		let Some(media) = item.get("media").filter(|media| media.is_object()) else {
+			continue;
+		};
+		let id = media["id"].as_str().map(str::to_string).unwrap_or_else(|| index.to_string());
+		let mimetype = media["mimetype"].as_str().unwrap_or("image/jpeg");
+
+		let mut source = Map::new();
+		source.insert("u".to_string(), media["url"].clone());
+		source.insert("x".to_string(), media["width"].clone());
+		source.insert("y".to_string(), media["height"].clone());
+		if mimetype == "image/gif" {
+			if let Some(mp4) = media["mp4Url"].as_str() {
+				source.insert("gif".to_string(), Value::String(mp4.to_string()));
+			}
+		}
+
+		metadata.insert(id.clone(), json!({ "m": mimetype, "s": source }));
+		gallery_items.push(json!({
+			"media_id": id,
+			"caption": item["caption"].clone(),
+			"outbound_url": item["outboundUrl"].clone(),
+		}));
+	}
+
+	(!gallery_items.is_empty()).then(|| (json!({ "items": gallery_items }), Value::Object(metadata)))
 }
 
 fn markdown_to_html(markdown: &str) -> String {
@@ -1138,6 +1277,139 @@ mod tests {
 		assert!(post["stickied"].as_bool().unwrap());
 		assert!(post["selftext_html"].as_str().unwrap().contains("<strong>bold</strong>"));
 		assert!(post["created_utc"].as_f64().unwrap() > 1_700_000_000.0);
+	}
+
+	fn post_of(extra: Value) -> Map<String, Value> {
+		let mut node = json!({
+			"id": "t3_abc",
+			"title": "media",
+			"createdAt": "2026-11-02T08:54:01.782000+0000",
+			"authorInfo": { "name": "alice" },
+			"subreddit": { "name": "rust" },
+			"permalink": "/r/rust/comments/abc/media/",
+			"url": "https://i.redd.it/abc.jpeg",
+			"domain": "i.redd.it"
+		});
+		for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+			node[key] = value;
+		}
+		node.as_object().cloned().unwrap_or_default()
+	}
+
+	#[test]
+	fn test_image_post_maps_to_the_image_hint() {
+		// An image post: `Media::parse` needs `post_hint` and a preview source, and
+		// the i.redd.it link itself is the image.
+		let node = post_of(json!({
+			"media": {
+				"typeHint": "IMAGE",
+				"still": { "source": { "url": "https://preview.redd.it/abc.jpeg?auto=webp", "dimensions": { "width": 3024, "height": 4032 } } }
+			}
+		}));
+
+		let post = to_post(&node);
+		assert_eq!(post["post_hint"], "image");
+		assert_eq!(post["preview"]["images"][0]["source"]["url"], "https://preview.redd.it/abc.jpeg?auto=webp");
+		assert_eq!(post["preview"]["images"][0]["source"]["width"], 3024);
+		assert!(post["is_reddit_media_domain"].as_bool().unwrap());
+		assert!(!post["is_gallery"].as_bool().unwrap());
+		// The link itself is still what gets rendered.
+		assert_eq!(post["url"], "https://i.redd.it/abc.jpeg");
+	}
+
+	#[test]
+	fn test_animated_post_keeps_the_mp4_variant() {
+		let node = post_of(json!({
+			"media": {
+				"typeHint": "ANIMATED",
+				"still": { "source": { "url": "https://preview.redd.it/gif.jpeg", "dimensions": { "width": 320, "height": 240 } } },
+				"animated": { "mp4_source": { "url": "https://preview.redd.it/gif.mp4", "dimensions": { "width": 320, "height": 240 } } }
+			}
+		}));
+
+		let post = to_post(&node);
+		assert_eq!(post["post_hint"], "image");
+		// `Media::parse` renders this as a `gif` because of the mp4 variant.
+		assert_eq!(post["preview"]["images"][0]["variants"]["mp4"]["source"]["url"], "https://preview.redd.it/gif.mp4");
+	}
+
+	#[test]
+	fn test_hosted_video_prefers_the_packaged_mp4() {
+		let node = post_of(json!({
+			"domain": "v.redd.it",
+			"url": "https://v.redd.it/xyz",
+			"media": {
+				"typeHint": "VIDEO",
+				"streaming": {
+					"hlsUrl": "https://v.redd.it/xyz/HLSPlaylist.m3u8",
+					"dashUrl": "https://v.redd.it/xyz/DASHPlaylist.mpd",
+					"isGif": false,
+					"dimensions": { "width": 1080, "height": 1538 }
+				},
+				"packagedMedia": { "muxedMp4s": {
+					"medium": { "url": "https://packaged-media.redd.it/xyz/muxed-medium.mp4" },
+					"high": { "url": "https://packaged-media.redd.it/xyz/muxed-high.mp4" }
+				} },
+				"still": { "source": { "url": "https://preview.redd.it/xyz.jpeg", "dimensions": { "width": 1080, "height": 1538 } } }
+			}
+		}));
+
+		let post = to_post(&node);
+		assert_eq!(post["post_hint"], "hosted:video");
+		let video = &post["preview"]["reddit_video_preview"];
+		assert_eq!(video["fallback_url"], "https://packaged-media.redd.it/xyz/muxed-medium.mp4");
+		assert_eq!(video["hls_url"], "https://v.redd.it/xyz/HLSPlaylist.m3u8");
+		assert_eq!(video["width"], 1080);
+		// The other place `Media::parse` looks has to agree.
+		assert_eq!(post["secure_media"]["reddit_video"]["fallback_url"], video["fallback_url"]);
+		// The still is the poster.
+		assert_eq!(post["preview"]["images"][0]["source"]["url"], "https://preview.redd.it/xyz.jpeg");
+	}
+
+	#[test]
+	fn test_gallery_post_maps_items_and_metadata() {
+		let node = post_of(json!({
+			"domain": "reddit.com",
+			"url": "https://www.reddit.com/gallery/xyz",
+			"gallery": { "items": [
+				{ "caption": null, "outboundUrl": null, "media": {
+					"__typename": "ImageAsset", "id": "img1", "url": "https://i.redd.it/img1.png",
+					"mimetype": "image/png", "width": 3024, "height": 4032
+				} },
+				{ "caption": "second", "outboundUrl": "https://example.com", "media": {
+					"__typename": "ImageAsset", "id": "img2", "url": "https://i.redd.it/img2.png",
+					"mimetype": "image/png", "width": 10, "height": 20
+				} }
+			] }
+		}));
+
+		let post = to_post(&node);
+		assert!(post["is_gallery"].as_bool().unwrap());
+		// Galleries must not take the image path, or the items are never rendered.
+		assert_eq!(post["post_hint"], "");
+		assert_eq!(post["gallery_data"]["items"][0]["media_id"], "img1");
+		assert_eq!(post["gallery_data"]["items"][1]["caption"], "second");
+		assert_eq!(post["media_metadata"]["img1"]["s"]["u"], "https://i.redd.it/img1.png");
+		assert_eq!(post["media_metadata"]["img1"]["s"]["x"], 3024);
+		assert_eq!(post["media_metadata"]["img1"]["m"], "image/png");
+		// The first item doubles as the poster.
+		assert_eq!(post["preview"]["images"][0]["source"]["url"], "https://i.redd.it/img1.png");
+	}
+
+	#[test]
+	fn test_embedded_video_stays_a_link() {
+		let node = post_of(json!({
+			"domain": "youtube.com",
+			"url": "https://www.youtube.com/watch?v=x",
+			"media": { "typeHint": "EMBED", "video": { "url": "https://www.youtube.com/watch?v=x" } }
+		}));
+
+		let post = to_post(&node);
+		assert_eq!(post["post_hint"], "rich:video");
+		// Nothing to inline: `Media::parse` falls through to a plain link.
+		assert!(post["preview"].is_null());
+		assert!(post["secure_media"].is_null());
+		assert!(!post["is_reddit_media_domain"].as_bool().unwrap());
 	}
 
 	#[test]
